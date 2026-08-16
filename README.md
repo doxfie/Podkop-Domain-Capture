@@ -1,6 +1,7 @@
 # Podkop Domain Capture
 
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-BusyBox%20ash-00B5E2)
+![Dependencies](https://img.shields.io/badge/dependencies-tcpdump--mini%20%2B%20nft-orange)
 ![Version](https://img.shields.io/badge/version-0.3.0--beta-blue)
 
 Короткая SSH-утилита для OpenWrt: ловит домены, к которым обращается клиент, и помогает собрать список для добавления в Podkop.
