@@ -12,7 +12,7 @@ SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
 SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
 DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.3.1-beta"
+PDC_VERSION="0.3.2-beta"
 
 # Самообновление и зависимости.
 SCRIPT_URL="${PDC_SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"
@@ -107,6 +107,17 @@ read_answer() {
 		esac
 	done
 
+	return 0
+}
+
+# Выбрасывает всё, что осталось в буфере ввода. Нужно после посимвольного
+# чтения: если клавишу нажали с Enter, перевод строки остаётся в буфере и
+# молча отвечает на следующий вопрос вместо пользователя.
+drain_input() {
+	# Вариант с -t 0 на этой сборке busybox возвращает успех, ничего не
+	# прочитав, поэтому забираем остаток строки построчным чтением с коротким
+	# таймаутом: если в буфере пусто, просто выйдем по таймауту.
+	IFS= read -r -t 1 DRAIN_REST < "$TTY_DEV" 2>/dev/null
 	return 0
 }
 
@@ -1427,6 +1438,7 @@ capture_stream() {
 	if ! read_char; then
 		wait
 	fi
+	drain_input
 
 	capture_stop_sources
 
@@ -1434,24 +1446,6 @@ capture_stream() {
 	echo "Сбор остановлен"
 	echo "Лог сохранен: $LOG_FILE"
 	return 0
-}
-
-ask_show_unique() {
-	echo
-	printf "Вывести уникальные домены из сохраненного лога? [y/N]: "
-	if ! read_answer; then
-		echo
-		return 0
-	fi
-
-	case "$ANSWER" in
-		y|Y|yes|YES|д|Д|да|Да|ДА)
-			show_unique
-			;;
-		*)
-			echo "Ок, можно посмотреть позже из главного меню."
-			;;
-	esac
 }
 
 start_capture() {
@@ -1479,14 +1473,20 @@ start_capture() {
 
 	trap - INT TERM HUP
 	capture_cleanup
-	ask_show_unique
+	echo
+	print_unique_domains
 	pause_enter
 	return "$CAPTURE_RC"
 }
 
 show_unique() {
 	tui_header "Уникальные домены" "Результат последнего сбора"
+	print_unique_domains
+}
 
+# Печатает список без шапки и без очистки экрана: после сбора он должен
+# лечь под собранные строки, а не заменить их.
+print_unique_domains() {
 	if [ ! -s "$LOG_FILE" ]; then
 		echo "Лог $LOG_FILE не найден или пуст."
 		return 1
