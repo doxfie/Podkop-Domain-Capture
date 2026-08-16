@@ -1187,7 +1187,7 @@ sni_start() {
 			printf '%s\n' "$SNI_LINE" >> "$LOG_FILE"
 			# shellcheck disable=SC2086
 			set -- $SNI_LINE
-			printf "%-8s %-${CLIENT_COL_W}s %-30s %s\n" "$1" "$2" "$3" "$4"
+			printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "$1" "$2" "$4" "$3"
 		done &
 
 	SNI_ACTIVE="1"
@@ -1223,7 +1223,7 @@ dns_start() {
 				continue
 			fi
 			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
-			printf "%-8s %-${CLIENT_COL_W}s %-30s %s\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" "dns"
+			printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "$CAP_TIME" "$CAP_CLIENT" "dns" "$CAP_DOMAIN"
 		done &
 
 	DNS_ACTIVE="1"
@@ -1560,9 +1560,11 @@ capture_stream() {
 	tui_hint "Любая клавиша - остановить сбор"
 	echo "Лог сохраняется в: $LOG_FILE"
 	echo
-	printf "%-8s %-${CLIENT_COL_W}s %-30s %s\n" "TIME" "CLIENT_IP" "DOMAIN" "SRC"
+	# SRC идёт перед доменом: домен последний, поэтому его длина уже никому
+	# не мешает и таблица не разъезжается.
+	printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "TIME" "CLIENT_IP" "SRC" "DOMAIN"
 	printf '%s %s %s %s\n' \
-		"$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "$(dashes 30)" "---"
+		"$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 40)"
 
 	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
 		sni_start "$MODE" "$IP_LIST"
