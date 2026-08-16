@@ -93,6 +93,10 @@ clear_screen() {
 	printf '\033[H\033[J'
 }
 
+dashes() {
+	awk -v n="$1" 'BEGIN { s = ""; while (length(s) < n) s = s "-"; print s }'
+}
+
 # Читает строку в ANSWER и срезает хвост. Windows-терминалы присылают CR,
 # из-за чего "q" приходит как "q\r" и не совпадает ни с одним шаблоном case.
 read_answer() {
@@ -1179,8 +1183,11 @@ sni_start() {
 		_ "$SNI_PID_FILE" "$SNI_FILTER" |
 		awk -f "$SNI_AWK_FILE" |
 		while IFS= read -r SNI_LINE; do
-			printf '%s\n' "$SNI_LINE"
+			# В файл пишем как есть, на экран - по колонкам.
 			printf '%s\n' "$SNI_LINE" >> "$LOG_FILE"
+			# shellcheck disable=SC2086
+			set -- $SNI_LINE
+			printf "%-8s %-${CLIENT_COL_W}s %-30s %s\n" "$1" "$2" "$3" "$4"
 		done &
 
 	SNI_ACTIVE="1"
@@ -1215,8 +1222,8 @@ dns_start() {
 			if ! client_allowed "$DNS_MODE" "$DNS_IPS"; then
 				continue
 			fi
-			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN"
 			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
+			printf "%-8s %-${CLIENT_COL_W}s %-30s %s\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" "dns"
 		done &
 
 	DNS_ACTIVE="1"
@@ -1542,12 +1549,20 @@ capture_stream() {
 		fi
 	fi
 
+	# Колонку под адрес расширяем только когда в сборе вообще возможен IPv6:
+	# при чистом IPv4 широкая колонка оставляет полэкрана пустоты.
+	CLIENT_COL_W="15"
+	if [ "$MODE" = "all" ] || [ -n "$(printf '%s' "$SELECTED_IPS6" | tr -d ' ')" ]; then
+		CLIENT_COL_W="39"
+	fi
+
 	tui_header "Live-сбор доменов" "Источник: $SOURCE_LABEL   Клиенты: $TARGET_LABEL"
 	tui_hint "Любая клавиша - остановить сбор"
 	echo "Лог сохраняется в: $LOG_FILE"
 	echo
-	echo "TIME     CLIENT_IP       DOMAIN                         SRC"
-	echo "-------- --------------- ------------------------------ ---"
+	printf "%-8s %-${CLIENT_COL_W}s %-30s %s\n" "TIME" "CLIENT_IP" "DOMAIN" "SRC"
+	printf '%s %s %s %s\n' \
+		"$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "$(dashes 30)" "---"
 
 	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
 		sni_start "$MODE" "$IP_LIST"
