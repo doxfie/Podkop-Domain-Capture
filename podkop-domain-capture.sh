@@ -713,10 +713,25 @@ END { flush() }
 PDC_SNI_AWK
 }
 
+# Путь к самому себе. Обычный запуск - это "pdc" по имени из PATH, и тогда
+# в $0 нет ни одного слэша: клеить его с текущим каталогом нельзя, надо искать
+# в PATH, иначе самообновление молча решает, что файла нет.
 self_path() {
 	case "$0" in
-		/*) printf '%s\n' "$0" ;;
-		*)  printf '%s/%s\n' "$(pwd)" "$0" ;;
+		/*)
+			printf '%s\n' "$0"
+			;;
+		*/*)
+			printf '%s/%s\n' "$(pwd)" "$0"
+			;;
+		*)
+			SELF_RESOLVED="$(command -v "$0" 2>/dev/null)"
+			if [ -n "$SELF_RESOLVED" ]; then
+				printf '%s\n' "$SELF_RESOLVED"
+			else
+				printf '%s\n' "$0"
+			fi
+			;;
 	esac
 }
 
