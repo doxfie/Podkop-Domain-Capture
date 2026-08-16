@@ -10,6 +10,7 @@ CLIENTS_FILE="/tmp/podkop-domain-capture.clients"
 LOG_IPS_FILE="/tmp/podkop-domain-capture.log-ips"
 SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
 SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
+SNI_ERR_FILE="/tmp/podkop-domain-capture.tcpdump.err"
 DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
 TTY_DEV="/dev/tty"
 PDC_VERSION="0.4.0-beta"
@@ -657,21 +658,35 @@ select_capture_targets() {
 	done
 }
 
+# Имя LAN-моста берём из конфигурации: br-lan это лишь частый случай, а не
+# данность. Раньше оно было зашито, и на другом имени сбор молча пустовал.
+lan_device() {
+	LAN_DEV="$(uci -q get network.lan.device 2>/dev/null)"
+	if [ -z "$LAN_DEV" ]; then
+		LAN_DEV="$(uci -q get network.lan.ifname 2>/dev/null)"
+	fi
+	if [ -z "$LAN_DEV" ]; then
+		LAN_DEV="br-lan"
+	fi
+	printf '%s\n' "$LAN_DEV"
+}
+
 lan_subnet() {
-	# 192.168.1.0/24 для br-lan; пусто, если определить не удалось.
-	ip -4 route show dev br-lan proto kernel 2>/dev/null | awk 'NR==1 { print $1 }'
+	# 192.168.1.0/24 для LAN; пусто, если определить не удалось.
+	ip -4 route show dev "$(lan_device)" proto kernel 2>/dev/null | awk 'NR==1 { print $1 }'
 }
 
-# Все IPv6-подсети br-lan: обычно ULA, глобальная и fe80::/64.
+# Все IPv6-подсети LAN: обычно ULA, глобальная и fe80::/64.
 lan_subnets6() {
-	ip -6 route show dev br-lan proto kernel 2>/dev/null | awk '{ print $1 }'
+	ip -6 route show dev "$(lan_device)" proto kernel 2>/dev/null | awk '{ print $1 }'
 }
 
-# Собственные адреса роутера на br-lan - их исключаем в режиме "все клиенты".
+# Собственные адреса роутера - их исключаем в режиме "все клиенты".
 router_lan_ips() {
-	ip -4 addr show dev br-lan 2>/dev/null |
+	LAN_IF="$(lan_device)"
+	ip -4 addr show dev "$LAN_IF" 2>/dev/null |
 		awk '$1 == "inet" { split($2, a, "/"); print a[1] }'
-	ip -6 addr show dev br-lan 2>/dev/null |
+	ip -6 addr show dev "$LAN_IF" 2>/dev/null |
 		awk '$1 == "inet6" { split($2, a, "/"); print a[1] }'
 }
 
@@ -682,7 +697,7 @@ mac_for_ip() {
 # IPv6-адреса устройства берём из таблицы соседей: DHCPv6-аренды не покрывают
 # SLAAC и приватные адреса, а сюда попадает всё, с чем роутер реально общался.
 ipv6_for_mac() {
-	ip -6 neigh show dev br-lan 2>/dev/null |
+	ip -6 neigh show dev "$(lan_device)" 2>/dev/null |
 		awk -v mac="$1" '$2 == "lladdr" && tolower($3) == mac { print $1 }' |
 		sort -u
 }
@@ -1224,14 +1239,22 @@ sni_start() {
 	SNI_MODE="$1"
 	SNI_IPS="$2"
 
+	SNI_DEV="$(lan_device)"
+	if ! ip link show "$SNI_DEV" >/dev/null 2>&1; then
+		echo "Ошибка: интерфейс $SNI_DEV не найден, SNI-источник недоступен."
+		return 1
+	fi
+
 	write_sni_awk
 	SNI_FILTER="$(build_bpf_filter "$SNI_MODE" "$SNI_IPS")"
-	rm -f "$SNI_PID_FILE"
+	rm -f "$SNI_PID_FILE" "$SNI_ERR_FILE"
 
 	# Внутренний sh пишет свой PID и делает exec tcpdump, поэтому в PID-файле
 	# оказывается именно tcpdump и мы можем остановить его точечно.
-	sh -c 'echo $$ > "$1"; exec tcpdump -i br-lan -nn -l -s 0 -x "$2" 2>/dev/null' \
-		_ "$SNI_PID_FILE" "$SNI_FILTER" |
+	# stderr складываем в файл, а не в /dev/null: при неудачном старте это
+	# единственный источник причины.
+	sh -c 'echo $$ > "$1"; exec tcpdump -i "$4" -nn -l -s 0 -x "$2" 2>"$3"' \
+		_ "$SNI_PID_FILE" "$SNI_FILTER" "$SNI_ERR_FILE" "$SNI_DEV" |
 		awk -f "$SNI_AWK_FILE" |
 		while IFS= read -r SNI_LINE; do
 			# В файл пишем как есть, на экран - по колонкам.
@@ -1242,6 +1265,19 @@ sni_start() {
 		done &
 
 	SNI_ACTIVE="1"
+
+	# tcpdump мог не подняться - например, фильтр не скомпилировался. Без этой
+	# проверки сбор шёл бы дальше и просто не дал бы ни одной строки по SNI.
+	sleep 1
+	if [ ! -s "$SNI_PID_FILE" ] || ! kill -0 "$(cat "$SNI_PID_FILE")" 2>/dev/null; then
+		echo "Ошибка: tcpdump не запустился, SNI-источник недоступен."
+		if [ -s "$SNI_ERR_FILE" ]; then
+			head -n 3 "$SNI_ERR_FILE"
+		fi
+		SNI_ACTIVE="0"
+		return 1
+	fi
+
 	return 0
 }
 
@@ -1316,11 +1352,19 @@ enable_logs() {
 	# сообщений "делаю"/"сделано" всё равно появлялась бы одновременно.
 	printf 'Включаю dnsmasq logqueries... '
 
-	CURRENT_LOGQUERIES="$(uci -q get 'dhcp.@dnsmasq[0].logqueries' 2>/dev/null)"
-	if [ -z "$CURRENT_LOGQUERIES" ]; then
-		CURRENT_LOGQUERIES="unset"
+	# Пишем только если сохранённого значения ещё нет. Иначе так: первый сбор
+	# сохранил "unset", восстановление сорвалось, logqueries остался 1 - и
+	# второй сбор записал бы уже эту единицу, потеряв исходное состояние
+	# навсегда. Файл не удаляется после восстановления намеренно, чтобы пункт
+	# "Сбросить временные логи" мог доделать работу за прерванным сбором;
+	# после успешного восстановления значение в нём совпадает с текущим.
+	if [ ! -s "$PREV_FILE" ]; then
+		CURRENT_LOGQUERIES="$(uci -q get 'dhcp.@dnsmasq[0].logqueries' 2>/dev/null)"
+		if [ -z "$CURRENT_LOGQUERIES" ]; then
+			CURRENT_LOGQUERIES="unset"
+		fi
+		printf '%s\n' "$CURRENT_LOGQUERIES" > "$PREV_FILE" 2>/dev/null
 	fi
-	printf '%s\n' "$CURRENT_LOGQUERIES" > "$PREV_FILE" 2>/dev/null
 
 	if ! uci set 'dhcp.@dnsmasq[0].logqueries=1'; then
 		echo
@@ -1862,8 +1906,13 @@ cleanup() {
 		fi
 	fi
 
+	# Оба источника, а не только SNI: после жёсткого обрыва сбора здесь может
+	# висеть и logread.
 	if [ -s "$SNI_PID_FILE" ]; then
 		kill "$(cat "$SNI_PID_FILE")" 2>/dev/null
+	fi
+	if [ -s "$DNS_PID_FILE" ]; then
+		kill "$(cat "$DNS_PID_FILE")" 2>/dev/null
 	fi
 
 	rm -f "$LOG_FILE"
@@ -1872,12 +1921,12 @@ cleanup() {
 	rm -f "$LOG_IPS_FILE"
 	rm -f "$SNI_AWK_FILE"
 	rm -f "$SNI_PID_FILE"
+	rm -f "$SNI_ERR_FILE"
+	rm -f "$DNS_PID_FILE"
 
-	# Для удаления временных файлов по glob временно включаем pathname expansion.
-	set +f
-	rm -f /tmp/*domains*.log
-	rm -f /tmp/*dns*.log
-	set -f
+	# Раньше здесь стояли rm -f /tmp/*dns*.log и /tmp/*domains*.log. Под них
+	# попадали чужие файлы - тот же /tmp/dnsmasq.log. Все свои файлы перечислены
+	# выше поимённо, глоб не нужен.
 
 	echo "Очищаю RAM-log роутера..."
 	if /etc/init.d/log restart; then

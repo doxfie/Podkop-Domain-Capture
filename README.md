@@ -17,10 +17,13 @@ SSH-утилита для OpenWrt: показывает, к каким доме�
 ## 🚀 Установка
 
 ```sh
-wget -O /usr/bin/pdc https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh && chmod +x /usr/bin/pdc && pdc
+wget -O /usr/bin/.pdc.new https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh && chmod +x /usr/bin/.pdc.new && mv /usr/bin/.pdc.new /usr/bin/pdc && pdc
 ```
 
 Дальше просто `pdc`
+
+Скачивается во временный файл рядом и переименовывается: при обрыве связи
+рабочая установка останется нетронутой, а не превратится в обрезанный файл.
 
 ---
 

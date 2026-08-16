@@ -17,13 +17,40 @@ if ! command -v wget >/dev/null 2>&1; then
 	exit 1
 fi
 
-if ! wget -O "$TARGET" "$SCRIPT_URL"; then
+# Качаем рядом с целевым файлом и подменяем переименованием. Прямая запись
+# в "$TARGET" при обрыве связи оставила бы обрезанный исполняемый файл вместо
+# рабочей установки; mv в пределах одной ФС атомарен.
+NEW_FILE="$(dirname "$TARGET")/.pdc.new"
+rm -f "$NEW_FILE"
+
+if ! wget -O "$NEW_FILE" "$SCRIPT_URL"; then
 	echo "Ошибка: не удалось скачать скрипт."
+	rm -f "$NEW_FILE"
 	exit 1
 fi
 
-if ! chmod +x "$TARGET"; then
-	echo "Ошибка: не удалось сделать скрипт исполняемым: $TARGET"
+# Убеждаемся, что скачали скрипт целиком, а не страницу с ошибкой.
+if ! head -n 1 "$NEW_FILE" | grep -q '^#!/bin/ash'; then
+	echo "Ошибка: скачанный файл не похож на скрипт."
+	rm -f "$NEW_FILE"
+	exit 1
+fi
+
+if [ "$(wc -c < "$NEW_FILE")" -lt 10000 ]; then
+	echo "Ошибка: скачанный файл обрезан."
+	rm -f "$NEW_FILE"
+	exit 1
+fi
+
+if ! chmod +x "$NEW_FILE"; then
+	echo "Ошибка: не удалось сделать скрипт исполняемым."
+	rm -f "$NEW_FILE"
+	exit 1
+fi
+
+if ! mv "$NEW_FILE" "$TARGET"; then
+	echo "Ошибка: не удалось установить скрипт в $TARGET"
+	rm -f "$NEW_FILE"
 	exit 1
 fi
 
