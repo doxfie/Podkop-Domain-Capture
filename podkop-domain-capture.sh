@@ -1147,10 +1147,32 @@ enable_logs() {
 	return 0
 }
 
+# Возвращает logqueries к значению, сохранённому перед сбором. Раньше здесь
+# всегда выставлялся 0, поэтому у тех, у кого лог запросов был включён до
+# запуска утилиты, он оказывался выключён после выхода.
 disable_logs() {
-	printf 'Выключаю dnsmasq logqueries... '
+	RESTORE_TO="$(cat "$PREV_FILE" 2>/dev/null)"
+	case "$RESTORE_TO" in
+		0|1|unset) ;;
+		*) RESTORE_TO="0" ;;
+	esac
 
-	if ! uci set 'dhcp.@dnsmasq[0].logqueries=0'; then
+	if [ "$RESTORE_TO" = "0" ]; then
+		printf 'Выключаю dnsmasq logqueries... '
+	else
+		printf 'Возвращаю dnsmasq logqueries... '
+	fi
+
+	if [ "$RESTORE_TO" = "unset" ]; then
+		# rc=1 здесь означает, что опции и так нет, а это нужный нам результат,
+		# поэтому проверяем итог, а не код возврата.
+		uci -q delete 'dhcp.@dnsmasq[0].logqueries'
+		if [ -n "$(uci -q get 'dhcp.@dnsmasq[0].logqueries')" ]; then
+			echo
+			echo "Ошибка: не удалось убрать logqueries"
+			return 1
+		fi
+	elif ! uci set "dhcp.@dnsmasq[0].logqueries=$RESTORE_TO"; then
 		echo
 		echo "Ошибка: не удалось выполнить uci set"
 		return 1
@@ -1602,7 +1624,7 @@ show_unique_by_ip() {
 cleanup() {
 	tui_header "Сброс временных логов" "Очистка сохраненного live-лога и служебных файлов"
 	tui_section "Будет выполнено"
-	echo "   Выключить dnsmasq logqueries, если он остался включен."
+	echo "   Вернуть dnsmasq logqueries в состояние до сбора."
 	echo "   Удалить последний live-лог: $LOG_FILE"
 	echo "   Удалить служебные файлы pdc в /tmp."
 	echo "   Перезапустить RAM-log роутера."
@@ -1626,11 +1648,13 @@ cleanup() {
 	esac
 
 	echo
+	# Сохранённое значение важнее текущего: если сбор оборвался, восстанавливать
+	# надо именно его, а не просто выставлять 0.
 	CURRENT_LOGQUERIES="$(uci -q get 'dhcp.@dnsmasq[0].logqueries' 2>/dev/null)"
-	if [ "$CURRENT_LOGQUERIES" = "1" ]; then
+	if [ -s "$PREV_FILE" ] || [ "$CURRENT_LOGQUERIES" = "1" ]; then
 		disable_logs
 	else
-		echo "dnsmasq logqueries уже выключен."
+		echo "dnsmasq logqueries уже в исходном состоянии"
 	fi
 
 	if command -v nft >/dev/null 2>&1; then
