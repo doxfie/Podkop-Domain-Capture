@@ -12,7 +12,7 @@ SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
 SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
 DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.3.0-beta"
+PDC_VERSION="0.3.1-beta"
 
 # Самообновление и зависимости.
 SCRIPT_URL="${PDC_SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"

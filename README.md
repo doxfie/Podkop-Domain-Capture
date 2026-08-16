@@ -2,7 +2,7 @@
 
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-BusyBox%20ash-00B5E2)
 ![Dependencies](https://img.shields.io/badge/dependencies-tcpdump--mini%20%2B%20nft-orange)
-![Version](https://img.shields.io/badge/version-0.3.0--beta-blue)
+![Version](https://img.shields.io/badge/version-0.3.1--beta-blue)
 
 SSH-утилита для OpenWrt: показывает, к каким доменам обращается устройство в сети,
 чтобы добавить их в Podkop.
