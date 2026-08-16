@@ -690,6 +690,20 @@ router_lan_ips() {
 		awk '$1 == "inet6" { split($2, a, "/"); print a[1] }'
 }
 
+# Виден ли MAC на интерфейсе сбора. В /tmp/dhcp.leases нет колонки интерфейса:
+# dnsmasq складывает туда аренды со всех обслуживаемых мостов. Поэтому клиент
+# гостевой сети или IoT-VLAN попадает в список выбора, DNS по нему собирается,
+# а tcpdump слушает другой мост и SNI молчит - без единого признака ошибки.
+mac_on_device() {
+	{
+		ip -4 neigh show dev "$2" 2>/dev/null
+		ip -6 neigh show dev "$2" 2>/dev/null
+	} | awk -v mac="$1" '
+		$2 == "lladdr" && tolower($3) == mac { found = 1 }
+		END { exit !found }
+	'
+}
+
 mac_for_ip() {
 	awk -v ip="$1" '$3 == ip { print tolower($2); exit }' "$LEASES_FILE" 2>/dev/null
 }
@@ -1657,6 +1671,24 @@ capture_stream() {
 	echo
 	# SRC идёт перед доменом: домен последний, поэтому его длина уже никому
 	# не мешает и таблица не разъезжается.
+	# Если выбранного клиента не видно на интерфейсе сбора, SNI по нему не даст
+	# ничего, а DNS даст - со стороны это выглядит как "половина доменов
+	# потерялась", а не как ошибка настройки. Поэтому говорим прямо.
+	if [ "$MODE" != "all" ]; then
+		CAPTURE_DEV="$(lan_device)"
+		MISSING_MACS=""
+		for ONE_MAC in $SELECTED_MACS; do
+			if ! mac_on_device "$ONE_MAC" "$CAPTURE_DEV"; then
+				MISSING_MACS="$MISSING_MACS $ONE_MAC"
+			fi
+		done
+		if [ -n "$(printf '%s' "$MISSING_MACS" | tr -d ' ')" ]; then
+			tui_message "Внимание: на $CAPTURE_DEV не видно клиента$MISSING_MACS"
+			tui_message "Похоже, он в другой сети (гостевой или VLAN): DNS по нему будет, SNI - нет."
+			echo
+		fi
+	fi
+
 	printf "%-8s %-${CLIENT_COL_W}s %-3s %s\n" "TIME" "CLIENT_IP" "SRC" "DOMAIN"
 	printf '%s %s %s %s\n' \
 		"$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 40)"
@@ -1892,8 +1924,23 @@ cleanup() {
 	echo
 	# Сохранённое значение важнее текущего: если сбор оборвался, восстанавливать
 	# надо именно его, а не просто выставлять 0.
+	#
+	# Но сначала сверяем: PREV_FILE остаётся жить и после удачного сбора, и без
+	# этой проверки пункт каждый раз звал бы disable_logs - то есть ронял DNS
+	# всей сети перезапуском dnsmasq ради записи уже стоящего значения.
 	CURRENT_LOGQUERIES="$(uci -q get 'dhcp.@dnsmasq[0].logqueries' 2>/dev/null)"
-	if [ -s "$PREV_FILE" ] || [ "$CURRENT_LOGQUERIES" = "1" ]; then
+	if [ -z "$CURRENT_LOGQUERIES" ]; then
+		CURRENT_LOGQUERIES="unset"
+	fi
+	SAVED_LOGQUERIES="$(cat "$PREV_FILE" 2>/dev/null)"
+
+	if [ -s "$PREV_FILE" ]; then
+		if [ "$SAVED_LOGQUERIES" = "$CURRENT_LOGQUERIES" ]; then
+			echo "dnsmasq logqueries уже в исходном состоянии"
+		else
+			disable_logs
+		fi
+	elif [ "$CURRENT_LOGQUERIES" = "1" ]; then
 		disable_logs
 	else
 		echo "dnsmasq logqueries уже в исходном состоянии"
@@ -1924,9 +1971,10 @@ cleanup() {
 	rm -f "$SNI_ERR_FILE"
 	rm -f "$DNS_PID_FILE"
 
-	# Раньше здесь стояли rm -f /tmp/*dns*.log и /tmp/*domains*.log. Под них
-	# попадали чужие файлы - тот же /tmp/dnsmasq.log. Все свои файлы перечислены
-	# выше поимённо, глоб не нужен.
+	# Раньше здесь стояли rm -f /tmp/*dns*.log и /tmp/*domains*.log. Ни один
+	# файл этой утилиты под них не подходит: в имени "domain-capture", а не
+	# "domains", и "dns" в нём нет. То есть удаляли они только чужое - тот же
+	# /tmp/dnsmasq.log. Свои файлы перечислены выше поимённо.
 
 	echo "Очищаю RAM-log роутера..."
 	if /etc/init.d/log restart; then
