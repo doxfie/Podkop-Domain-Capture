@@ -80,6 +80,26 @@ clear_screen() {
 	printf '\033[H\033[J'
 }
 
+# Читает строку в ANSWER и срезает хвост. Windows-терминалы присылают CR,
+# из-за чего "q" приходит как "q\r" и не совпадает ни с одним шаблоном case.
+read_answer() {
+	if [ "$1" = "tty" ]; then
+		IFS= read -r ANSWER < "$TTY_DEV" || return 1
+	else
+		IFS= read -r ANSWER || return 1
+	fi
+
+	while :; do
+		case "$ANSWER" in
+			*"$CR_CHAR") ANSWER="${ANSWER%"$CR_CHAR"}" ;;
+			*' ') ANSWER="${ANSWER% }" ;;
+			*) break ;;
+		esac
+	done
+
+	return 0
+}
+
 pause_enter() {
 	echo
 	printf "Нажмите Enter, чтобы продолжить..."
@@ -661,33 +681,33 @@ END { flush() }
 PDC_SNI_AWK
 }
 
+# SNI-режим требует tcpdump. Ставим молча: без него режим по умолчанию
+# не работает, а лишний вопрос на первом запуске никто не читает.
 ensure_tcpdump() {
 	if command -v tcpdump >/dev/null 2>&1; then
 		return 0
 	fi
 
-	echo "tcpdump не найден, он нужен для перехвата SNI."
-	printf "Установить пакет tcpdump-mini (~385 КБ)? [y/N]: "
-	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
-		echo
-		return 1
-	fi
-	case "$ANSWER" in
-		y|Y|yes|YES|д|Д|да|Да|ДА) ;;
-		*) echo "Установка отменена."; return 1 ;;
-	esac
+	echo
+	echo "Для перехвата SNI нужен tcpdump, ставлю tcpdump-mini (~385 КБ)..."
 
-	echo "Устанавливаю tcpdump-mini..."
 	if command -v apk >/dev/null 2>&1; then
-		apk add tcpdump-mini || return 1
+		TCPDUMP_OUT="$(apk add tcpdump-mini 2>&1)"
 	elif command -v opkg >/dev/null 2>&1; then
-		opkg update && opkg install tcpdump-mini || return 1
+		TCPDUMP_OUT="$(opkg update 2>&1 && opkg install tcpdump-mini 2>&1)"
 	else
 		echo "Ошибка: не найден ни apk, ни opkg."
 		return 1
 	fi
 
-	command -v tcpdump >/dev/null 2>&1
+	if command -v tcpdump >/dev/null 2>&1; then
+		echo "tcpdump установлен."
+		return 0
+	fi
+
+	echo "Не удалось установить tcpdump-mini:"
+	printf '%s\n' "$TCPDUMP_OUT" | tail -5
+	return 1
 }
 
 # BPF-фильтр: только TLS ClientHello от нужных клиентов.
@@ -907,94 +927,155 @@ capture_cleanup() {
 	fi
 }
 
-show_capture_tips() {
-	tui_header "Перед стартом сбора" "Подготовьте клиентское устройство перед live-сбором"
-	tui_hint "Enter - начать сбор   q - назад"
-	echo
+capture_source_label() {
+	case "$CAPTURE_SOURCE" in
+		dns) printf 'только DNS (лог dnsmasq)\n' ;;
+		sni) printf 'только SNI (TLS ClientHello)\n' ;;
+		*)   printf 'DNS + SNI\n' ;;
+	esac
+}
 
-	tui_section "Рекомендации"
-	echo "   Откройте проверяемый сайт в инкогнито/приватном окне."
-	echo "   Сбросьте DNS-кеш на устройстве, с которого открываете сайт."
-	echo "   Если доменов мало, перезапустите браузер или Wi-Fi на устройстве."
-	echo
+capture_rules_label() {
+	RULES_LABEL=""
+	if [ "$OPT_DNS_HIJACK" = "1" ]; then
+		RULES_LABEL="перехват DNS"
+	fi
+	if [ "$OPT_BLOCK_DOT" = "1" ]; then
+		if [ -n "$RULES_LABEL" ]; then
+			RULES_LABEL="$RULES_LABEL, блок DoT"
+		else
+			RULES_LABEL="блок DoT"
+		fi
+	fi
+	if [ "$OPT_BLOCK_QUIC" = "1" ]; then
+		if [ -n "$RULES_LABEL" ]; then
+			RULES_LABEL="$RULES_LABEL, блок QUIC"
+		else
+			RULES_LABEL="блок QUIC"
+		fi
+	fi
+	if [ -z "$RULES_LABEL" ]; then
+		RULES_LABEL="выключены"
+	fi
+	printf '%s\n' "$RULES_LABEL"
+}
 
-	tui_section "Где выполнять команды"
-	tui_message "   Выполняйте их на ПК/телефоне клиента, не в этом SSH-терминале роутера."
-	echo
+ask_yes_no() {
+	# $1 - текст, $2 - текущее значение. Возвращает 0 = да, 1 = нет.
+	if [ "$2" = "1" ]; then
+		printf '%s [Y/n]: ' "$1"
+	else
+		printf '%s [y/N]: ' "$1"
+	fi
+	if ! read_answer tty; then
+		echo
+		return "$([ "$2" = "1" ] && echo 0 || echo 1)"
+	fi
+	case "$ANSWER" in
+		y|Y|yes|YES|д|Д|да|Да|ДА) return 0 ;;
+		n|N|no|NO|н|Н|нет|Нет|НЕТ) return 1 ;;
+		*) [ "$2" = "1" ] && return 0 || return 1 ;;
+	esac
+}
 
-	tui_section "DNS-кеш на клиенте"
-	echo "   Windows CMD/PowerShell: ipconfig /flushdns"
-	echo "   macOS Terminal:         sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
-	echo "   Linux terminal:         sudo resolvectl flush-caches"
-	echo "   iOS/Android:            включите/выключите авиарежим или перезапустите Wi-Fi"
-	echo "   Smart TV / приставка:   перезагрузите устройство полностью"
-	echo
+configure_capture_advanced() {
+	tui_header "Настройки сбора" "Значения по умолчанию подходят почти всегда"
 
 	tui_section "Источник доменов"
 	echo "   1) DNS + SNI  - рекомендуется, ловит и запросы, и уже закешированные домены"
-	echo "   2) только DNS - как раньше: лог dnsmasq"
-	echo "   3) только SNI - имена из TLS ClientHello, DNS не нужен"
+	echo "   2) только DNS - лог dnsmasq, без tcpdump"
+	echo "   3) только SNI - имена из TLS ClientHello, dnsmasq не трогается вовсе"
 	echo
-	printf "Выбор [1]: "
-	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
+	printf "Выбор [текущий: %s]: " "$(capture_source_label)"
+	if ! read_answer tty; then
 		echo
 		return 1
 	fi
 	case "$ANSWER" in
+		1) CAPTURE_SOURCE="both" ;;
 		2) CAPTURE_SOURCE="dns" ;;
 		3) CAPTURE_SOURCE="sni" ;;
-		q|Q) return 1 ;;
-		*) CAPTURE_SOURCE="both" ;;
 	esac
+
+	echo
+	tui_section "Временные правила на время сбора"
+	tui_message "   Живут в отдельной таблице nft и снимаются при остановке."
+	echo
+	if ask_yes_no "   Перехват DNS - завернуть :53 клиента на роутер?" "$OPT_DNS_HIJACK"; then
+		OPT_DNS_HIJACK="1"
+	else
+		OPT_DNS_HIJACK="0"
+	fi
+	if ask_yes_no "   Блок DoT - закрыть :853?" "$OPT_BLOCK_DOT"; then
+		OPT_BLOCK_DOT="1"
+	else
+		OPT_BLOCK_DOT="0"
+	fi
+	if ask_yes_no "   Блок QUIC - закрыть udp:443, иначе SNI не виден?" "$OPT_BLOCK_QUIC"; then
+		OPT_BLOCK_QUIC="1"
+	else
+		OPT_BLOCK_QUIC="0"
+	fi
+
+	echo
+	tui_section "Сброс DNS-кеша на клиенте (выполнять на самом устройстве)"
+	echo "   Windows:      ipconfig /flushdns"
+	echo "   macOS:        sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
+	echo "   Linux:        sudo resolvectl flush-caches"
+	echo "   iOS/Android:  включите и выключите авиарежим"
+	echo "   Smart TV:     перезагрузите устройство полностью"
+	pause_enter
+	return 0
+}
+
+show_capture_tips() {
+	TIPS_MODE="$1"
+	TIPS_IPS="$2"
+
+	if [ "$TIPS_MODE" = "all" ]; then
+		TIPS_TARGET="все клиенты"
+	else
+		TIPS_TARGET="$TIPS_IPS"
+	fi
+
+	while :; do
+		tui_header "Сбор доменов" "Клиенты: $TIPS_TARGET"
+		printf "   Источник:  %s\n" "$(capture_source_label)"
+		printf "   Правила:   %s\n" "$(capture_rules_label)"
+		echo
+		tui_message "   Совет: перезагрузите устройство перед сбором - это сбросит его DNS-кеш."
+		echo
+		printf "%sEnter%s - начать   %ss%s - настройки   %sq%s - назад: " \
+			"$TUI_GREEN" "$TUI_RESET" "$TUI_GREEN" "$TUI_RESET" "$TUI_GREEN" "$TUI_RESET"
+		if ! read_answer tty; then
+			echo
+			return 1
+		fi
+
+		case "$ANSWER" in
+			q|Q|й|Й)
+				return 1
+				;;
+			s|S|ы|Ы)
+				configure_capture_advanced
+				;;
+			*)
+				break
+				;;
+		esac
+	done
 
 	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
 		if ! ensure_tcpdump; then
 			if [ "$CAPTURE_SOURCE" = "sni" ]; then
 				echo "Без tcpdump режим SNI недоступен."
+				pause_enter
 				return 1
 			fi
 			echo "Продолжаю только с DNS-источником."
 			CAPTURE_SOURCE="dns"
 		fi
 	fi
-
-	echo
-	tui_section "Временные сетевые правила на время сбора"
-	echo "   Перехват DNS  - завернуть :53 клиента на роутер (ловит хардкод 8.8.8.8)"
-	echo "   Блок DoT      - закрыть :853, чтобы клиент не ушёл в DNS-over-TLS"
-	echo "   Блок QUIC     - закрыть udp:443, чтобы TLS шёл по TCP и SNI был читаем"
-	tui_message "   Все правила живут в отдельной таблице nft и снимаются при выходе."
-	echo
-	printf "Включить их? [Y/n]: "
-	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
-		echo
-		return 1
-	fi
-	case "$ANSWER" in
-		n|N|no|NO|н|Н|нет|Нет|НЕТ)
-			OPT_DNS_HIJACK="0"
-			OPT_BLOCK_DOT="0"
-			OPT_BLOCK_QUIC="0"
-			;;
-		*)
-			OPT_DNS_HIJACK="1"
-			OPT_BLOCK_DOT="1"
-			OPT_BLOCK_QUIC="1"
-			;;
-	esac
-
-	echo
-	printf "%sEnter%s - начать сбор, %sq%s - назад: " "$TUI_GREEN" "$TUI_RESET" "$TUI_GREEN" "$TUI_RESET"
-	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
-		echo
-		return 1
-	fi
-
-	case "$ANSWER" in
-		q|Q)
-			return 1
-			;;
-	esac
 
 	return 0
 }
@@ -1124,7 +1205,7 @@ capture_stream() {
 ask_show_unique() {
 	echo
 	printf "Вывести уникальные домены из сохраненного лога? [y/N]: "
-	if ! IFS= read -r ANSWER; then
+	if ! read_answer; then
 		echo
 		return 0
 	fi
@@ -1143,7 +1224,7 @@ start_capture() {
 	MODE="$1"
 	IP_LIST="$2"
 
-	if ! show_capture_tips; then
+	if ! show_capture_tips "$MODE" "$IP_LIST"; then
 		return 0
 	fi
 
@@ -1337,7 +1418,7 @@ cleanup() {
 	tui_message "   DNS-кеш на ПК/телефоне клиента этим пунктом не очищается."
 	echo
 	printf "%sy%s - сбросить, Enter/q - назад: " "$TUI_GREEN" "$TUI_RESET"
-	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
+	if ! read_answer tty; then
 		echo
 		return 1
 	fi
