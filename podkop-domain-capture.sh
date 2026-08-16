@@ -449,7 +449,6 @@ render_capture_menu() {
 
 	printf '   Источник:  %s\n' "$(capture_source_label)"
 	printf '   Правила:   %s\n' "$(capture_rules_label)"
-	tui_message "   Совет: перезагрузите устройство перед сбором - это сбросит его DNS-кеш."
 	echo
 
 	if [ "$CLIENT_TOTAL" -eq 0 ]; then
@@ -1007,7 +1006,7 @@ nft_guard_enable() {
 
 	rm -f /tmp/podkop-domain-capture.nft
 	NFT_ACTIVE="1"
-	echo "Временные сетевые правила включены (таблица inet $NFT_TABLE)."
+	echo "Временные сетевые правила включены (таблица inet $NFT_TABLE)"
 	return 0
 }
 
@@ -1016,7 +1015,7 @@ nft_guard_disable() {
 		return 0
 	fi
 	if nft delete table inet "$NFT_TABLE" 2>/dev/null; then
-		echo "Временные сетевые правила сняты."
+		echo "Временные сетевые правила сняты"
 	else
 		echo "Предупреждение: не удалось снять таблицу inet $NFT_TABLE."
 		echo "Снимите вручную: nft delete table inet $NFT_TABLE"
@@ -1114,59 +1113,63 @@ capture_stop_sources() {
 
 enable_logs() {
 	echo
-	echo "Сохраняю текущее значение dhcp.@dnsmasq[0].logqueries..."
+	# Одна строка с прогрессом: перезапуск dnsmasq проходит быстро, и пара
+	# сообщений "делаю"/"сделано" всё равно появлялась бы одновременно.
+	printf 'Включаю dnsmasq logqueries... '
 
 	CURRENT_LOGQUERIES="$(uci -q get 'dhcp.@dnsmasq[0].logqueries' 2>/dev/null)"
 	if [ -z "$CURRENT_LOGQUERIES" ]; then
 		CURRENT_LOGQUERIES="unset"
 	fi
+	printf '%s\n' "$CURRENT_LOGQUERIES" > "$PREV_FILE" 2>/dev/null
 
-	printf "%s\n" "$CURRENT_LOGQUERIES" > "$PREV_FILE" 2>/dev/null
-	echo "Предыдущее значение: $CURRENT_LOGQUERIES"
-
-	echo "Включаю dnsmasq logqueries..."
 	if ! uci set 'dhcp.@dnsmasq[0].logqueries=1'; then
-		echo "Ошибка: не удалось выполнить uci set."
+		echo
+		echo "Ошибка: не удалось выполнить uci set"
 		return 1
 	fi
 	if ! uci commit dhcp; then
-		echo "Ошибка: не удалось выполнить uci commit dhcp."
+		echo
+		echo "Ошибка: не удалось выполнить uci commit dhcp"
 		return 1
 	fi
 	# Перезапуск дёргает netifd, тот пишет в консоль udhcpc-строки. Прячем их,
 	# но сохраняем вывод, чтобы показать при реальной ошибке.
 	if ! RESTART_OUT="$(/etc/init.d/dnsmasq restart 2>&1)"; then
-		echo "Ошибка: не удалось перезапустить dnsmasq."
+		echo
+		echo "Ошибка: не удалось перезапустить dnsmasq"
 		printf '%s\n' "$RESTART_OUT"
 		return 1
 	fi
 
-	echo "dnsmasq logqueries включен."
+	echo "готово"
 	LOGS_ENABLED="1"
 	return 0
 }
 
 disable_logs() {
-	echo
-	echo "Выключаю dnsmasq logqueries..."
+	printf 'Выключаю dnsmasq logqueries... '
 
 	if ! uci set 'dhcp.@dnsmasq[0].logqueries=0'; then
-		echo "Ошибка: не удалось выполнить uci set."
+		echo
+		echo "Ошибка: не удалось выполнить uci set"
 		return 1
 	fi
 	if ! uci commit dhcp; then
-		echo "Ошибка: не удалось выполнить uci commit dhcp."
+		echo
+		echo "Ошибка: не удалось выполнить uci commit dhcp"
 		return 1
 	fi
 	# Перезапуск дёргает netifd, тот пишет в консоль udhcpc-строки. Прячем их,
 	# но сохраняем вывод, чтобы показать при реальной ошибке.
 	if ! RESTART_OUT="$(/etc/init.d/dnsmasq restart 2>&1)"; then
-		echo "Ошибка: не удалось перезапустить dnsmasq."
+		echo
+		echo "Ошибка: не удалось перезапустить dnsmasq"
 		printf '%s\n' "$RESTART_OUT"
 		return 1
 	fi
 
-	echo "dnsmasq logqueries выключен."
+	echo "готово"
 	LOGS_ENABLED="0"
 	return 0
 }
@@ -1391,7 +1394,7 @@ capture_stream() {
 	capture_stop_sources
 
 	echo
-	echo "Сбор остановлен."
+	echo "Сбор остановлен"
 	echo "Лог сохранен: $LOG_FILE"
 	return 0
 }
