@@ -15,7 +15,14 @@ TTY_DEV="/dev/tty"
 PDC_VERSION="0.4.0-beta"
 
 # Самообновление и зависимости.
-SCRIPT_URL="${PDC_SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"
+#
+# Обновляемся по последнему релизу, а не по ветке: в ветку попадает и работа
+# в процессе, а тег - это осознанный выпуск. PDC_SCRIPT_URL перекрывает всё
+# и берёт файл напрямую - удобно для форка и отладки.
+SCRIPT_REPO="${PDC_SCRIPT_REPO:-doxfie/Podkop-Domain-Capture}"
+SCRIPT_FILE="podkop-domain-capture.sh"
+SCRIPT_URL="${PDC_SCRIPT_URL:-}"
+RELEASE_API="https://api.github.com/repos/$SCRIPT_REPO/releases/latest"
 UPDATE_STAMP="/etc/podkop-domain-capture.stamp"
 UPDATE_INTERVAL="86400"
 TCPDUMP_PKG="tcpdump-mini"
@@ -925,15 +932,56 @@ update_tcpdump() {
 	return 0
 }
 
+# Тег последнего релиза из GitHub API. jsonfilter входит в базовый OpenWrt,
+# но если его вдруг нет - вытаскиваем поле обычным grep.
+latest_release_tag() {
+	TAG_FILE="/tmp/podkop-domain-capture.release"
+	rm -f "$TAG_FILE"
+	if ! fetch_url "$RELEASE_API" "$TAG_FILE"; then
+		rm -f "$TAG_FILE"
+		return 1
+	fi
+
+	RELEASE_TAG=""
+	if command -v jsonfilter >/dev/null 2>&1; then
+		RELEASE_TAG="$(jsonfilter -i "$TAG_FILE" -e '@.tag_name' 2>/dev/null)"
+	fi
+	if [ -z "$RELEASE_TAG" ]; then
+		RELEASE_TAG="$(grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$TAG_FILE" |
+			head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+	fi
+	rm -f "$TAG_FILE"
+
+	if [ -z "$RELEASE_TAG" ]; then
+		return 1
+	fi
+	printf '%s\n' "$RELEASE_TAG"
+	return 0
+}
+
 update_script() {
 	SELF="$(self_path)"
 	if [ ! -w "$SELF" ]; then
 		return 0
 	fi
 
-	NEW_FILE="/tmp/podkop-domain-capture.new"
+	if [ -n "$SCRIPT_URL" ]; then
+		SRC_URL="$SCRIPT_URL"
+	else
+		RELEASE_TAG="$(latest_release_tag)" || return 0
+		# Тег вида v0.4.0-beta: сверяем без "v" и не качаем лишнего.
+		if ! version_newer "${RELEASE_TAG#v}" "$PDC_VERSION"; then
+			return 0
+		fi
+		SRC_URL="https://raw.githubusercontent.com/$SCRIPT_REPO/$RELEASE_TAG/$SCRIPT_FILE"
+	fi
+
+	# Временный файл кладём рядом с целевым: mv в пределах одной ФС - это
+	# rename(2). Из /tmp (tmpfs) в /usr/bin (overlay) busybox копировал бы
+	# содержимое, то есть переписывал бы исполняемый прямо сейчас файл.
+	NEW_FILE="$(dirname "$SELF")/.podkop-domain-capture.new"
 	rm -f "$NEW_FILE"
-	if ! fetch_url "$SCRIPT_URL" "$NEW_FILE"; then
+	if ! fetch_url "$SRC_URL" "$NEW_FILE"; then
 		rm -f "$NEW_FILE"
 		return 0
 	fi
@@ -961,13 +1009,16 @@ update_script() {
 	fi
 
 	echo "Доступна версия $REMOTE_VERSION (установлена $PDC_VERSION), обновляю..."
-	if ! cat "$NEW_FILE" > "$SELF"; then
-		echo "Предупреждение: не удалось записать $SELF, продолжаю на текущей версии."
+	chmod +x "$NEW_FILE" 2>/dev/null
+
+	# Подменяем файл переименованием, а не перезаписью: работающий шелл
+	# продолжит читать старый inode, который останется жить до его выхода.
+	if ! mv "$NEW_FILE" "$SELF"; then
+		echo "Предупреждение: не удалось заменить $SELF, продолжаю на текущей версии."
 		rm -f "$NEW_FILE"
 		return 0
 	fi
-	chmod +x "$SELF"
-	rm -f "$NEW_FILE"
+
 	echo "Обновлено до $REMOTE_VERSION, перезапускаю..."
 	PDC_UPDATED=1 exec "$SELF"
 }
