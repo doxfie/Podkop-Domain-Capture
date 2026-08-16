@@ -661,9 +661,11 @@ lan_device() {
 	printf '%s\n' "$LAN_DEV"
 }
 
-lan_subnet() {
-	# 192.168.1.0/24 для LAN; пусто, если определить не удалось.
-	ip -4 route show dev "$(lan_device)" proto kernel 2>/dev/null | awk 'NR==1 { print $1 }'
+# Все IPv4-подсети LAN. Раньше бралась только первая (NR==1): при втором
+# адресе на интерфейсе - список ipaddr или alias - вторая подсеть молча
+# выпадала и из правил, и из проверки принадлежности клиента.
+lan_subnets() {
+	ip -4 route show dev "$(lan_device)" proto kernel 2>/dev/null | awk '{ print $1 }'
 }
 
 # Все IPv6-подсети LAN: обычно ULA, глобальная и fe80::/64.
@@ -709,13 +711,17 @@ ip_in_subnet() {
 # записи в neigh нет, и предупреждение было бы ложным. Адрес вне подсети
 # интерфейса - признак надёжный.
 client_off_capture_net() {
-	OFF_SUBNET="$(lan_subnet)"
-	if [ -z "$OFF_SUBNET" ]; then
+	OFF_SUBNETS="$(lan_subnets)"
+	if [ -z "$OFF_SUBNETS" ]; then
 		return 1
 	fi
-	if ip_in_subnet "$1" "$OFF_SUBNET"; then
-		return 1
-	fi
+	# Подсетей на интерфейсе может быть несколько - попадание в любую значит,
+	# что клиент достижим.
+	for OFF_ONE in $OFF_SUBNETS; do
+		if ip_in_subnet "$1" "$OFF_ONE"; then
+			return 1
+		fi
+	done
 	return 0
 }
 
@@ -1209,7 +1215,7 @@ nft_guard_enable() {
 	fi
 
 	if [ "$NFT_MODE" = "all" ]; then
-		NFT_SRC_LIST="$(lan_subnet) $(lan_subnets6)"
+		NFT_SRC_LIST="$(lan_subnets) $(lan_subnets6)"
 	elif [ -n "$(printf '%s' "$SELECTED_MACS" | tr -d ' ')" ]; then
 		# По MAC - одно правило на клиента вместо десятков по адресам.
 		NFT_SRC_LIST="$SELECTED_MACS"
