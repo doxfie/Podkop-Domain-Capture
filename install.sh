@@ -29,25 +29,6 @@ fi
 
 echo
 echo "Скрипт установлен: $TARGET"
-
-# tcpdump нужен источнику SNI, который включён по умолчанию. Ставим здесь,
-# чтобы первый запуск не тормозил на установке пакета. Ошибка не критична:
-# скрипт умеет откатиться на источник DNS и повторить установку сам.
-if ! command -v tcpdump >/dev/null 2>&1; then
-	echo "Ставлю tcpdump-mini (нужен для перехвата SNI)..."
-	if command -v apk >/dev/null 2>&1; then
-		apk add tcpdump-mini >/dev/null 2>&1
-	elif command -v opkg >/dev/null 2>&1; then
-		opkg update >/dev/null 2>&1 && opkg install tcpdump-mini >/dev/null 2>&1
-	fi
-	if command -v tcpdump >/dev/null 2>&1; then
-		echo "tcpdump установлен."
-	else
-		echo "Предупреждение: не удалось поставить tcpdump-mini."
-		echo "Сбор по DNS будет работать, SNI - нет. Скрипт попробует поставить его сам."
-	fi
-fi
-
 echo "Повторный запуск: pdc"
 echo "Запускаю..."
 echo

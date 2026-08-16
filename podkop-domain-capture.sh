@@ -11,7 +11,15 @@ LOG_IPS_FILE="/tmp/podkop-domain-capture.log-ips"
 SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
 SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.2.0-beta"
+PDC_VERSION="0.3.0-beta"
+
+# Самообновление и зависимости.
+SCRIPT_URL="${PDC_SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"
+UPDATE_STAMP="/etc/podkop-domain-capture.stamp"
+UPDATE_INTERVAL="86400"
+TCPDUMP_PKG="tcpdump-mini"
+TCPDUMP_SIZE="~385 КБ"
+MAINTENANCE_NOTED="0"
 
 # Имя временной nft-таблицы. Отдельная таблица, чтобы не трогать fw4/podkop/zapret
 # и чтобы весь набор правил снимался одной командой delete table.
@@ -681,33 +689,202 @@ END { flush() }
 PDC_SNI_AWK
 }
 
-# SNI-режим требует tcpdump. Ставим молча: без него режим по умолчанию
-# не работает, а лишний вопрос на первом запуске никто не читает.
-ensure_tcpdump() {
-	if command -v tcpdump >/dev/null 2>&1; then
-		return 0
+self_path() {
+	case "$0" in
+		/*) printf '%s\n' "$0" ;;
+		*)  printf '%s/%s\n' "$(pwd)" "$0" ;;
+	esac
+}
+
+fetch_url() {
+	if command -v wget >/dev/null 2>&1; then
+		wget -q -O "$2" --timeout=15 "$1" 2>/dev/null && return 0
 	fi
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsS --max-time 15 -o "$2" "$1" 2>/dev/null && return 0
+	fi
+	return 1
+}
+
+# 0, если версия $1 строго новее $2. Суффиксы вида -beta отбрасываем.
+# Нужно именно "новее", а не "отличается": иначе скрипт откатит сам себя,
+# если в репозитории лежит версия старее установленной.
+version_newer() {
+	awk -v a="$1" -v b="$2" '
+	function norm(v,	n, p, i, s) {
+		sub(/-.*$/, "", v)
+		n = split(v, p, ".")
+		s = 0
+		for (i = 1; i <= 3; i++) s = s * 1000 + (i <= n ? p[i] + 0 : 0)
+		return s
+	}
+	BEGIN { exit !(norm(a) > norm(b)) }'
+}
+
+pkg_version() {
+	if command -v apk >/dev/null 2>&1; then
+		apk list -I "$1" 2>/dev/null | awk 'NR==1 { print $1 }'
+	elif command -v opkg >/dev/null 2>&1; then
+		opkg list-installed "$1" 2>/dev/null | awk 'NR==1 { print $3 }'
+	fi
+}
+
+# Первый запуск: tcpdump обязателен, потому что SNI - основной источник.
+# Три попытки, дальше выходим: продолжать без него нет смысла.
+install_tcpdump_or_die() {
+	echo
+	echo "Первый запуск: для перехвата SNI нужен tcpdump."
+	printf 'Устанавливаю %s (%s, плюс libpcap)...\n' "$TCPDUMP_PKG" "$TCPDUMP_SIZE"
+
+	INSTALL_OUT=""
+	ATTEMPT="1"
+	while [ "$ATTEMPT" -le 3 ]; do
+		if [ "$ATTEMPT" -gt 1 ]; then
+			echo "Попытка $ATTEMPT из 3..."
+			sleep 3
+		fi
+
+		if command -v apk >/dev/null 2>&1; then
+			apk update >/dev/null 2>&1
+			INSTALL_OUT="$(apk add "$TCPDUMP_PKG" 2>&1)"
+		elif command -v opkg >/dev/null 2>&1; then
+			opkg update >/dev/null 2>&1
+			INSTALL_OUT="$(opkg install "$TCPDUMP_PKG" 2>&1)"
+		else
+			INSTALL_OUT="не найден ни apk, ни opkg"
+			break
+		fi
+
+		if command -v tcpdump >/dev/null 2>&1; then
+			echo "tcpdump установлен."
+			MAINTENANCE_NOTED="1"
+			return 0
+		fi
+
+		ATTEMPT=$((ATTEMPT + 1))
+	done
 
 	echo
-	echo "Для перехвата SNI нужен tcpdump, ставлю tcpdump-mini (~385 КБ)..."
+	echo "Ошибка: не удалось установить $TCPDUMP_PKG за 3 попытки."
+	if [ -n "$INSTALL_OUT" ]; then
+		printf '%s\n' "$INSTALL_OUT" | tail -5
+	fi
+	echo
+	echo "Сбор по SNI - основной режим, без tcpdump он невозможен."
+	echo "Проверьте интернет и свободное место, затем запустите pdc снова."
+	exit 1
+}
+
+update_tcpdump() {
+	VER_BEFORE="$(pkg_version "$TCPDUMP_PKG")"
 
 	if command -v apk >/dev/null 2>&1; then
-		TCPDUMP_OUT="$(apk add tcpdump-mini 2>&1)"
+		apk update >/dev/null 2>&1
+		# Только этот пакет: голый apk upgrade потянул бы luci, hostapd и прочее.
+		apk upgrade "$TCPDUMP_PKG" >/dev/null 2>&1
 	elif command -v opkg >/dev/null 2>&1; then
-		TCPDUMP_OUT="$(opkg update 2>&1 && opkg install tcpdump-mini 2>&1)"
+		opkg update >/dev/null 2>&1
+		opkg upgrade "$TCPDUMP_PKG" >/dev/null 2>&1
 	else
-		echo "Ошибка: не найден ни apk, ни opkg."
-		return 1
-	fi
-
-	if command -v tcpdump >/dev/null 2>&1; then
-		echo "tcpdump установлен."
 		return 0
 	fi
 
-	echo "Не удалось установить tcpdump-mini:"
-	printf '%s\n' "$TCPDUMP_OUT" | tail -5
+	VER_AFTER="$(pkg_version "$TCPDUMP_PKG")"
+	if [ -n "$VER_AFTER" ] && [ "$VER_BEFORE" != "$VER_AFTER" ]; then
+		echo "tcpdump обновлён: $VER_BEFORE -> $VER_AFTER"
+		MAINTENANCE_NOTED="1"
+	fi
+	return 0
+}
+
+update_script() {
+	SELF="$(self_path)"
+	if [ ! -w "$SELF" ]; then
+		return 0
+	fi
+
+	NEW_FILE="/tmp/podkop-domain-capture.new"
+	rm -f "$NEW_FILE"
+	if ! fetch_url "$SCRIPT_URL" "$NEW_FILE"; then
+		rm -f "$NEW_FILE"
+		return 0
+	fi
+
+	# Санитарная проверка: это должен быть наш скрипт целиком, а не 404-страница
+	# и не обрезанная закачка.
+	if ! head -n 1 "$NEW_FILE" | grep -q '^#!/bin/ash'; then
+		rm -f "$NEW_FILE"
+		return 0
+	fi
+	if [ "$(wc -c < "$NEW_FILE")" -lt 10000 ]; then
+		rm -f "$NEW_FILE"
+		return 0
+	fi
+
+	REMOTE_VERSION="$(grep -m1 '^PDC_VERSION=' "$NEW_FILE" | cut -d'"' -f2)"
+	if [ -z "$REMOTE_VERSION" ]; then
+		rm -f "$NEW_FILE"
+		return 0
+	fi
+
+	if ! version_newer "$REMOTE_VERSION" "$PDC_VERSION"; then
+		rm -f "$NEW_FILE"
+		return 0
+	fi
+
+	echo "Доступна версия $REMOTE_VERSION (установлена $PDC_VERSION), обновляю..."
+	if ! cat "$NEW_FILE" > "$SELF"; then
+		echo "Предупреждение: не удалось записать $SELF, продолжаю на текущей версии."
+		rm -f "$NEW_FILE"
+		return 0
+	fi
+	chmod +x "$SELF"
+	rm -f "$NEW_FILE"
+	echo "Обновлено до $REMOTE_VERSION, перезапускаю..."
+	PDC_UPDATED=1 exec "$SELF"
+}
+
+update_due() {
+	if [ ! -f "$UPDATE_STAMP" ]; then
+		return 0
+	fi
+	NOW="$(date +%s 2>/dev/null)"
+	THEN="$(cat "$UPDATE_STAMP" 2>/dev/null)"
+	case "$NOW$THEN" in
+		*[!0-9]*|"") return 0 ;;
+	esac
+	if [ "$((NOW - THEN))" -ge "$UPDATE_INTERVAL" ]; then
+		return 0
+	fi
 	return 1
+}
+
+mark_update_done() {
+	date +%s > "$UPDATE_STAMP" 2>/dev/null
+}
+
+startup_maintenance() {
+	if ! command -v tcpdump >/dev/null 2>&1; then
+		install_tcpdump_or_die
+		mark_update_done
+	else
+		# Уже перезапускались после обновления - второй круг не нужен.
+		if [ -z "$PDC_UPDATED" ] && update_due; then
+			echo "Проверяю обновления..."
+			mark_update_done
+			update_tcpdump
+			# Может не вернуться: обновит скрипт и сделает exec.
+			update_script
+			if [ "$MAINTENANCE_NOTED" = "0" ]; then
+				echo "Всё актуально."
+			fi
+		fi
+	fi
+
+	if [ "$MAINTENANCE_NOTED" = "1" ]; then
+		pause_enter
+	fi
+	return 0
 }
 
 # BPF-фильтр: только TLS ClientHello от нужных клиентов.
@@ -1065,18 +1242,7 @@ show_capture_tips() {
 		esac
 	done
 
-	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
-		if ! ensure_tcpdump; then
-			if [ "$CAPTURE_SOURCE" = "sni" ]; then
-				echo "Без tcpdump режим SNI недоступен."
-				pause_enter
-				return 1
-			fi
-			echo "Продолжаю только с DNS-источником."
-			CAPTURE_SOURCE="dns"
-		fi
-	fi
-
+	# tcpdump гарантирован startup_maintenance при запуске скрипта.
 	return 0
 }
 
@@ -1473,6 +1639,7 @@ cleanup() {
 }
 
 ensure_interactive_input
+startup_maintenance
 
 while :; do
 	select_main_menu || exit 1
