@@ -226,13 +226,17 @@ tui_header() {
 
 # Заголовок секции прямо в потоке вывода: выглядит как шапка экрана, но не
 # чистит его - нужен там, где под заголовком должно остаться напечатанное выше.
+# $3 = "open" - не печатать нижнюю полосу: так заголовок сливается со своим
+# содержимым, когда под ним идёт длинный список.
 tui_block() {
 	printf '\n%s%s%s\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
 	printf '%s%s%s%s\n' "$TUI_BOLD" "$TUI_GREEN" "$1" "$TUI_RESET"
 	if [ -n "$2" ]; then
 		printf '%s%s%s\n' "$TUI_DIM" "$2" "$TUI_RESET"
 	fi
-	printf '%s%s%s\n\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
+	if [ "$3" != "open" ]; then
+		printf '%s%s%s\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
+	fi
 }
 
 tui_hint() {
@@ -1482,7 +1486,6 @@ start_capture() {
 
 	trap - INT TERM HUP
 	capture_cleanup
-	echo
 	print_unique_domains
 	pause_enter
 	return "$CAPTURE_RC"
@@ -1502,7 +1505,7 @@ print_unique_domains() {
 	fi
 
 	UNIQUE_COUNT="$(awk '{print $3}' "$LOG_FILE" | sort -u | wc -l | tr -d ' ')"
-	tui_block "Уникальные домены" "Найдено: $UNIQUE_COUNT   Лог: $LOG_FILE"
+	tui_block "Уникальные домены" "Найдено: $UNIQUE_COUNT" open
 	awk '{print $3}' "$LOG_FILE" | sort -u
 	return 0
 }
@@ -1625,7 +1628,7 @@ show_unique_by_ip() {
 	fi
 
 	BY_IP_COUNT="$(awk -v ip="$SELECTED_LOG_IP" '$2==ip{print $3}' "$LOG_FILE" | sort -u | wc -l | tr -d ' ')"
-	tui_block "Уникальные домены" "Клиент: $SELECTED_LOG_IP   Найдено: $BY_IP_COUNT"
+	tui_block "Уникальные домены" "Клиент: $SELECTED_LOG_IP   Найдено: $BY_IP_COUNT" open
 	awk -v ip="$SELECTED_LOG_IP" '$2==ip{print $3}' "$LOG_FILE" | sort -u
 	return 0
 }
