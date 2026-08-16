@@ -281,16 +281,6 @@ render_client_table_header() {
 	printf '%s   %-3s %-15s %-36s %-19s %s%s\n' "$TUI_DIM" "" "IP" "Name" "MAC" "Lease" "$TUI_RESET"
 }
 
-format_client_table_row() {
-	CHECK="$1"
-	IP="$2"
-	HOST="$3"
-	MAC="$4"
-	LEASE="$5"
-
-	printf '%s %-15s %-36.36s %-19s %s' "$CHECK" "$IP" "$HOST" "$MAC" "$LEASE"
-}
-
 render_main_menu() {
 	tui_header "Podkop Domain Capture" "Сбор DNS-доменов из dnsmasq logs для Podkop"
 	tui_hint "Стрелки вверх/вниз - выбор   Enter - открыть   q - выход"
@@ -514,10 +504,12 @@ render_capture_menu() {
 		render_client_table_header
 	fi
 
-	I="1"
-	while [ "$I" -le "$CLIENT_TOTAL" ]; do
-		LINE="$(get_client_line "$I")"
-		split_client_line "$LINE"
+	# Раньше каждая строка стоила sed -n "Np" плюс подстановку - то есть два
+	# форка на клиента на каждое нажатие клавиши. Читаем файл один раз и
+	# печатаем напрямую: форков не остаётся вовсе.
+	I="0"
+	while IFS='|' read -r CLIENT_IP CLIENT_MAC CLIENT_HOST CLIENT_REMAINING; do
+		I=$((I + 1))
 
 		if is_ip_selected "$CLIENT_IP"; then
 			CHECK="[x]"
@@ -525,17 +517,15 @@ render_capture_menu() {
 			CHECK="[ ]"
 		fi
 
-		DISPLAY="$(format_client_table_row "$CHECK" "$CLIENT_IP" "$CLIENT_HOST" "$CLIENT_MAC" "$CLIENT_REMAINING")"
-		ROW_INDEX=$((I + 1))
-
-		if [ "$CAPTURE_INDEX" -eq "$ROW_INDEX" ]; then
-			render_menu_line 1 "$DISPLAY"
+		if [ "$CAPTURE_INDEX" -eq $((I + 1)) ]; then
+			printf '%s > %s %-15s %-36.36s %-19s %s %s\n' \
+				"$TUI_SELECTED" "$CHECK" "$CLIENT_IP" "$CLIENT_HOST" \
+				"$CLIENT_MAC" "$CLIENT_REMAINING" "$TUI_RESET"
 		else
-			render_menu_line 0 "$DISPLAY"
+			printf '   %s %-15s %-36.36s %-19s %s\n' \
+				"$CHECK" "$CLIENT_IP" "$CLIENT_HOST" "$CLIENT_MAC" "$CLIENT_REMAINING"
 		fi
-
-		I=$((I + 1))
-	done
+	done < "$CLIENTS_FILE"
 
 	echo
 	tui_section "Действия"
@@ -690,18 +680,43 @@ router_lan_ips() {
 		awk '$1 == "inet6" { split($2, a, "/"); print a[1] }'
 }
 
-# Виден ли MAC на интерфейсе сбора. В /tmp/dhcp.leases нет колонки интерфейса:
-# dnsmasq складывает туда аренды со всех обслуживаемых мостов. Поэтому клиент
-# гостевой сети или IoT-VLAN попадает в список выбора, DNS по нему собирается,
-# а tcpdump слушает другой мост и SNI молчит - без единого признака ошибки.
-mac_on_device() {
-	{
-		ip -4 neigh show dev "$2" 2>/dev/null
-		ip -6 neigh show dev "$2" 2>/dev/null
-	} | awk -v mac="$1" '
-		$2 == "lladdr" && tolower($3) == mac { found = 1 }
-		END { exit !found }
-	'
+# Лежит ли IPv4 внутри CIDR. Без побитовых операций: busybox awk их не имеет,
+# поэтому сравниваем номера блоков размером 2^(32-префикс).
+ip_in_subnet() {
+	awk -v ip="$1" -v cidr="$2" '
+	function toint(a,	p, i, v) {
+		if (split(a, p, ".") != 4) return -1
+		v = 0
+		for (i = 1; i <= 4; i++) v = v * 256 + (p[i] + 0)
+		return v
+	}
+	BEGIN {
+		if (split(cidr, c, "/") != 2) exit 1
+		size = 1
+		for (i = 0; i < 32 - (c[2] + 0); i++) size = size * 2
+		x = toint(ip); y = toint(c[1])
+		if (x < 0 || y < 0) exit 1
+		exit !(int(x / size) == int(y / size))
+	}'
+}
+
+# Достижим ли клиент на интерфейсе сбора. В /tmp/dhcp.leases нет колонки
+# интерфейса: dnsmasq складывает туда аренды со всех обслуживаемых мостов.
+# Клиент гостевой сети или IoT-VLAN попадает в список выбора, DNS по нему
+# собирается, а tcpdump слушает другой мост и SNI молчит - без признака ошибки.
+#
+# Судим по подсети, а не по таблице соседей: у давно молчавшего устройства
+# записи в neigh нет, и предупреждение было бы ложным. Адрес вне подсети
+# интерфейса - признак надёжный.
+client_off_capture_net() {
+	OFF_SUBNET="$(lan_subnet)"
+	if [ -z "$OFF_SUBNET" ]; then
+		return 1
+	fi
+	if ip_in_subnet "$1" "$OFF_SUBNET"; then
+		return 1
+	fi
+	return 0
 }
 
 mac_for_ip() {
@@ -757,62 +772,69 @@ function b2(i,	h, l) {
 	return h * 256 + l
 }
 
+# Возвращает 1, если имя найдено и напечатано. Вызывается после каждой строки
+# с байтами, а не только по приходу следующего пакета: иначе домен появлялся бы
+# на экране лишь тогда, когда пойдёт следующее TLS-соединение.
 function flush(	ver, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, name, i, c) {
-	if (HEX == "" || SRC == "") return
-	if (b(0) < 0) return
+	if (HEX == "" || SRC == "") return 0
+	if (b(0) < 0) return 0
 
 	ver = int(b(0) / 16)
 	if (ver == 4) {
-		if (b(9) != 6) return			# protocol = TCP
+		if (b(9) != 6) return 0			# protocol = TCP
 		tcp = (b(0) % 16) * 4			# IHL в 32-битных словах
 	} else if (ver == 6) {
-		if (b(6) != 6) return			# next header = TCP, без расширений
+		if (b(6) != 6) return 0			# next header = TCP, без расширений
 		tcp = 40				# заголовок IPv6 фиксирован
 	} else {
-		return
+		return 0
 	}
 
 	doff = int(b(tcp + 12) / 16) * 4
-	if (doff < 20) return
+	if (doff < 20) return 0
 	p = tcp + doff
-	if (b(p) != 22) return
-	if (b(p + 5) != 1) return
+	if (b(p) != 22) return 0
+	if (b(p + 5) != 1) return 0
 
 	n = p + 43
-	sidl = b(n); if (sidl < 0) return
+	sidl = b(n); if (sidl < 0) return 0
 	n += 1 + sidl
-	csl = b2(n); if (csl < 0) return
+	csl = b2(n); if (csl < 0) return 0
 	n += 2 + csl
-	cml = b(n); if (cml < 0) return
+	cml = b(n); if (cml < 0) return 0
 	n += 1 + cml
-	extl = b2(n); if (extl < 0) return
+	extl = b2(n); if (extl < 0) return 0
 	n += 2
 	end = n + extl
 
 	while (n + 4 <= end) {
 		et = b2(n); el = b2(n + 2)
-		if (et < 0 || el < 0) return
+		if (et < 0 || el < 0) return 0
 		n += 4
 		if (et == 0) {
 			nl = b2(n + 3)
-			if (nl <= 0 || nl > 253) return
+			if (nl <= 0 || nl > 253) return 0
+			# Имя обязано умещаться в само расширение: список (2) +
+			# тип (1) + длина (2) + имя. Иначе разбор уполз бы в соседнее.
+			if (nl + 5 > el) return 0
 			name = ""
 			for (i = 0; i < nl; i++) {
 				c = b(n + 5 + i)
-				if (c < 33 || c > 126) return
+				if (c < 33 || c > 126) return 0
 				name = name sprintf("%c", c)
 			}
 			printf "%s %s %s sni\n", TS, SRC, name
 			fflush()
-			return
+			return 1
 		}
 		n += el
 	}
+	return 0
 }
 
 /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
-	flush()
-	HEX = ""; SRC = ""
+	if (!DONE) flush()
+	HEX = ""; SRC = ""; DONE = 0
 	TS = substr($1, 1, 8)
 	if ($2 == "IP") {
 		# 192.168.1.130.54321 - адрес это первые четыре октета
@@ -826,15 +848,20 @@ function flush(	ver, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, nam
 	next
 }
 
-/^[ \t]+0x[0-9a-f]+:/ {
+# [[:space:]] вместо [ \t]: escape-последовательности внутри скобочного
+# выражения POSIX не определяет, хотя на практике их понимают все awk.
+/^[[:space:]]+0x[0-9a-f]+:/ {
 	line = $0
-	sub(/^[ \t]+0x[0-9a-f]+:[ \t]*/, "", line)
-	gsub(/[ \t]/, "", line)
+	sub(/^[[:space:]]+0x[0-9a-f]+:[[:space:]]*/, "", line)
+	gsub(/[[:space:]]/, "", line)
 	HEX = HEX line
+	# Пробуем разобрать сразу: как только байтов хватило, имя уходит на экран,
+	# не дожидаясь следующего пакета.
+	if (!DONE && flush()) DONE = 1
 	next
 }
 
-END { flush() }
+END { if (!DONE) flush() }
 PDC_SNI_AWK
 }
 
@@ -882,7 +909,14 @@ version_newer() {
 		for (i = 1; i <= 3; i++) s = s * 1000 + (i <= n ? p[i] + 0 : 0)
 		return s
 	}
-	BEGIN { exit !(norm(a) > norm(b)) }'
+	function pre(v) { return (v ~ /-/) ? 1 : 0 }
+	BEGIN {
+		na = norm(a); nb = norm(b)
+		if (na != nb) exit !(na > nb)
+		# Числа равны: релиз новее одноимённого пререлиза, то есть
+		# 0.3.2 обновляет 0.3.2-beta, но не наоборот.
+		exit !(pre(a) == 0 && pre(b) == 1)
+	}'
 }
 
 pkg_version() {
@@ -1409,8 +1443,15 @@ enable_logs() {
 # запуска утилиты, он оказывался выключён после выхода.
 disable_logs() {
 	RESTORE_TO="$(cat "$PREV_FILE" 2>/dev/null)"
+	# OpenWrt понимает у булевых опций не только 1/0: get_bool в
+	# /lib/functions.sh принимает 1|on|true|yes|enabled и 0|off|false|no|disabled.
+	# Если в конфиге руками написано logqueries=on, схлопывать это в 0 нельзя -
+	# получилось бы ровно то выключение чужой настройки, от которого мы и
+	# защищаемся. В 0 отправляем только по-настоящему нераспознанное.
 	case "$RESTORE_TO" in
 		0|1|unset) ;;
+		on|true|yes|enabled) ;;
+		off|false|no|disabled) ;;
 		*) RESTORE_TO="0" ;;
 	esac
 
@@ -1675,16 +1716,15 @@ capture_stream() {
 	# ничего, а DNS даст - со стороны это выглядит как "половина доменов
 	# потерялась", а не как ошибка настройки. Поэтому говорим прямо.
 	if [ "$MODE" != "all" ]; then
-		CAPTURE_DEV="$(lan_device)"
-		MISSING_MACS=""
-		for ONE_MAC in $SELECTED_MACS; do
-			if ! mac_on_device "$ONE_MAC" "$CAPTURE_DEV"; then
-				MISSING_MACS="$MISSING_MACS $ONE_MAC"
+		OFF_NET_IPS=""
+		for ONE_IP in $IP_LIST; do
+			if client_off_capture_net "$ONE_IP"; then
+				OFF_NET_IPS="$OFF_NET_IPS $ONE_IP"
 			fi
 		done
-		if [ -n "$(printf '%s' "$MISSING_MACS" | tr -d ' ')" ]; then
-			tui_message "Внимание: на $CAPTURE_DEV не видно клиента$MISSING_MACS"
-			tui_message "Похоже, он в другой сети (гостевой или VLAN): DNS по нему будет, SNI - нет."
+		if [ -n "$(printf '%s' "$OFF_NET_IPS" | tr -d ' ')" ]; then
+			tui_message "Внимание:$OFF_NET_IPS вне подсети интерфейса $(lan_device)."
+			tui_message "Похоже, это другая сеть (гостевая или VLAN): DNS по ней будет, SNI - нет."
 			echo
 		fi
 	fi
