@@ -8,8 +8,23 @@ PREV_FILE="/tmp/podkop-domain-capture.logqueries.prev"
 LEASES_FILE="/tmp/dhcp.leases"
 CLIENTS_FILE="/tmp/podkop-domain-capture.clients"
 LOG_IPS_FILE="/tmp/podkop-domain-capture.log-ips"
+SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
+SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.1.0-beta"
+PDC_VERSION="0.2.0-beta"
+
+# Имя временной nft-таблицы. Отдельная таблица, чтобы не трогать fw4/podkop/zapret
+# и чтобы весь набор правил снимался одной командой delete table.
+NFT_TABLE="pdc_capture"
+
+# Источник доменов: dns | sni | both
+CAPTURE_SOURCE="both"
+# Временные сетевые правила на время сбора
+OPT_DNS_HIJACK="1"
+OPT_BLOCK_DOT="1"
+OPT_BLOCK_QUIC="1"
+NFT_ACTIVE="0"
+SNI_ACTIVE="0"
 
 ESC_CHAR="$(printf '\033')"
 CR_CHAR="$(printf '\r')"
@@ -548,6 +563,278 @@ select_capture_targets() {
 	done
 }
 
+lan_subnet() {
+	# 192.168.1.0/24 для br-lan; пусто, если определить не удалось.
+	ip -4 route show dev br-lan proto kernel 2>/dev/null | awk 'NR==1 { print $1 }'
+}
+
+router_lan_ip() {
+	ip -4 addr show dev br-lan 2>/dev/null |
+		awk '$1 == "inet" { split($2, a, "/"); print a[1]; exit }'
+}
+
+# Пишет awk-парсер TLS ClientHello. Держим его отдельным файлом, а не inline-строкой:
+# так проще отлаживать и не воевать с экранированием внутри ash.
+write_sni_awk() {
+	cat > "$SNI_AWK_FILE" <<'PDC_SNI_AWK'
+function hv(c) { return index("0123456789abcdef", c) - 1 }
+
+function b(i,	s) {
+	s = substr(HEX, i * 2 + 1, 2)
+	if (length(s) < 2) return -1
+	return hv(substr(s, 1, 1)) * 16 + hv(substr(s, 2, 1))
+}
+
+function b2(i,	h, l) {
+	h = b(i); l = b(i + 1)
+	if (h < 0 || l < 0) return -1
+	return h * 256 + l
+}
+
+function flush(	ihl, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, name, i, c) {
+	if (HEX == "" || SRC == "") return
+	if (b(0) < 0) return
+	if (int(b(0) / 16) != 4) return
+	if (b(9) != 6) return
+	ihl = (b(0) % 16) * 4
+	tcp = ihl
+	doff = int(b(tcp + 12) / 16) * 4
+	if (doff < 20) return
+	p = tcp + doff
+	if (b(p) != 22) return
+	if (b(p + 5) != 1) return
+
+	n = p + 43
+	sidl = b(n); if (sidl < 0) return
+	n += 1 + sidl
+	csl = b2(n); if (csl < 0) return
+	n += 2 + csl
+	cml = b(n); if (cml < 0) return
+	n += 1 + cml
+	extl = b2(n); if (extl < 0) return
+	n += 2
+	end = n + extl
+
+	while (n + 4 <= end) {
+		et = b2(n); el = b2(n + 2)
+		if (et < 0 || el < 0) return
+		n += 4
+		if (et == 0) {
+			nl = b2(n + 3)
+			if (nl <= 0 || nl > 253) return
+			name = ""
+			for (i = 0; i < nl; i++) {
+				c = b(n + 5 + i)
+				if (c < 33 || c > 126) return
+				name = name sprintf("%c", c)
+			}
+			printf "%s %s %s sni\n", TS, SRC, name
+			fflush()
+			return
+		}
+		n += el
+	}
+}
+
+/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
+	flush()
+	HEX = ""; SRC = ""
+	TS = substr($1, 1, 8)
+	if ($2 == "IP") {
+		nf = split($3, a, ".")
+		if (nf >= 5) SRC = a[1] "." a[2] "." a[3] "." a[4]
+	}
+	next
+}
+
+/^[ \t]+0x[0-9a-f]+:/ {
+	line = $0
+	sub(/^[ \t]+0x[0-9a-f]+:[ \t]*/, "", line)
+	gsub(/[ \t]/, "", line)
+	HEX = HEX line
+	next
+}
+
+END { flush() }
+PDC_SNI_AWK
+}
+
+ensure_tcpdump() {
+	if command -v tcpdump >/dev/null 2>&1; then
+		return 0
+	fi
+
+	echo "tcpdump не найден, он нужен для перехвата SNI."
+	printf "Установить пакет tcpdump-mini (~385 КБ)? [y/N]: "
+	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
+		echo
+		return 1
+	fi
+	case "$ANSWER" in
+		y|Y|yes|YES|д|Д|да|Да|ДА) ;;
+		*) echo "Установка отменена."; return 1 ;;
+	esac
+
+	echo "Устанавливаю tcpdump-mini..."
+	if command -v apk >/dev/null 2>&1; then
+		apk add tcpdump-mini || return 1
+	elif command -v opkg >/dev/null 2>&1; then
+		opkg update && opkg install tcpdump-mini || return 1
+	else
+		echo "Ошибка: не найден ни apk, ни opkg."
+		return 1
+	fi
+
+	command -v tcpdump >/dev/null 2>&1
+}
+
+# BPF-фильтр: только TLS ClientHello от нужных клиентов.
+build_bpf_filter() {
+	BPF_MODE="$1"
+	BPF_IPS="$2"
+	BPF_HOSTS=""
+
+	if [ "$BPF_MODE" = "all" ]; then
+		ROUTER_IP="$(router_lan_ip)"
+		if [ -n "$ROUTER_IP" ]; then
+			BPF_HOSTS="not src host $ROUTER_IP"
+		fi
+	else
+		for ONE_IP in $BPF_IPS; do
+			if [ -z "$BPF_HOSTS" ]; then
+				BPF_HOSTS="src host $ONE_IP"
+			else
+				BPF_HOSTS="$BPF_HOSTS or src host $ONE_IP"
+			fi
+		done
+		if [ -n "$BPF_HOSTS" ]; then
+			BPF_HOSTS="($BPF_HOSTS)"
+		fi
+	fi
+
+	# tcp[12] старшие 4 бита - data offset; первый байт payload 0x16 = TLS handshake.
+	BPF_BASE='tcp and tcp[((tcp[12:1]&0xf0)>>2)]=0x16'
+	if [ -n "$BPF_HOSTS" ]; then
+		printf '%s and %s\n' "$BPF_BASE" "$BPF_HOSTS"
+	else
+		printf '%s\n' "$BPF_BASE"
+	fi
+}
+
+nft_guard_enable() {
+	NFT_MODE="$1"
+	NFT_IPS="$2"
+
+	if ! command -v nft >/dev/null 2>&1; then
+		echo "Предупреждение: nft не найден, сетевые правила пропущены."
+		return 1
+	fi
+
+	if [ "$OPT_DNS_HIJACK" != "1" ] && [ "$OPT_BLOCK_DOT" != "1" ] && [ "$OPT_BLOCK_QUIC" != "1" ]; then
+		return 0
+	fi
+
+	if [ "$NFT_MODE" = "all" ]; then
+		NFT_SADDR="$(lan_subnet)"
+		if [ -z "$NFT_SADDR" ]; then
+			echo "Предупреждение: не удалось определить подсеть br-lan, правила пропущены."
+			return 1
+		fi
+		NFT_SRC_LIST="$NFT_SADDR"
+	else
+		NFT_SRC_LIST="$NFT_IPS"
+	fi
+
+	nft delete table inet "$NFT_TABLE" 2>/dev/null
+
+	{
+		printf 'table inet %s {\n' "$NFT_TABLE"
+		if [ "$OPT_DNS_HIJACK" = "1" ]; then
+			printf '\tchain pdc_nat_pre {\n'
+			printf '\t\ttype nat hook prerouting priority dstnat - 5; policy accept;\n'
+			for ONE_SRC in $NFT_SRC_LIST; do
+				printf '\t\tip saddr %s udp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$ONE_SRC"
+				printf '\t\tip saddr %s tcp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$ONE_SRC"
+			done
+			printf '\t}\n'
+		fi
+		if [ "$OPT_BLOCK_DOT" = "1" ] || [ "$OPT_BLOCK_QUIC" = "1" ]; then
+			printf '\tchain pdc_fwd {\n'
+			printf '\t\ttype filter hook forward priority filter - 5; policy accept;\n'
+			for ONE_SRC in $NFT_SRC_LIST; do
+				if [ "$OPT_BLOCK_DOT" = "1" ]; then
+					printf '\t\tip saddr %s tcp dport 853 counter reject with tcp reset comment "pdc-block-dot"\n' "$ONE_SRC"
+					printf '\t\tip saddr %s udp dport 853 counter drop comment "pdc-block-dot"\n' "$ONE_SRC"
+				fi
+				if [ "$OPT_BLOCK_QUIC" = "1" ]; then
+					printf '\t\tip saddr %s udp dport 443 counter drop comment "pdc-block-quic"\n' "$ONE_SRC"
+				fi
+			done
+			printf '\t}\n'
+		fi
+		printf '}\n'
+	} > /tmp/podkop-domain-capture.nft
+
+	if ! nft -f /tmp/podkop-domain-capture.nft; then
+		echo "Ошибка: не удалось загрузить временные nft-правила."
+		rm -f /tmp/podkop-domain-capture.nft
+		return 1
+	fi
+
+	rm -f /tmp/podkop-domain-capture.nft
+	NFT_ACTIVE="1"
+	echo "Временные сетевые правила включены (таблица inet $NFT_TABLE)."
+	return 0
+}
+
+nft_guard_disable() {
+	if [ "$NFT_ACTIVE" != "1" ]; then
+		return 0
+	fi
+	if nft delete table inet "$NFT_TABLE" 2>/dev/null; then
+		echo "Временные сетевые правила сняты."
+	else
+		echo "Предупреждение: не удалось снять таблицу inet $NFT_TABLE."
+		echo "Снимите вручную: nft delete table inet $NFT_TABLE"
+	fi
+	NFT_ACTIVE="0"
+	return 0
+}
+
+sni_start() {
+	SNI_MODE="$1"
+	SNI_IPS="$2"
+
+	write_sni_awk
+	SNI_FILTER="$(build_bpf_filter "$SNI_MODE" "$SNI_IPS")"
+	rm -f "$SNI_PID_FILE"
+
+	# Внутренний sh пишет свой PID и делает exec tcpdump, поэтому в PID-файле
+	# оказывается именно tcpdump и мы можем остановить его точечно.
+	sh -c 'echo $$ > "$1"; exec tcpdump -i br-lan -nn -l -s 0 -x "$2" 2>/dev/null' \
+		_ "$SNI_PID_FILE" "$SNI_FILTER" |
+		awk -f "$SNI_AWK_FILE" |
+		while IFS= read -r SNI_LINE; do
+			printf '%s\n' "$SNI_LINE"
+			printf '%s\n' "$SNI_LINE" >> "$LOG_FILE"
+		done &
+
+	SNI_ACTIVE="1"
+	return 0
+}
+
+sni_stop() {
+	if [ "$SNI_ACTIVE" != "1" ]; then
+		return 0
+	fi
+	if [ -s "$SNI_PID_FILE" ]; then
+		kill "$(cat "$SNI_PID_FILE")" 2>/dev/null
+	fi
+	rm -f "$SNI_PID_FILE"
+	SNI_ACTIVE="0"
+	return 0
+}
+
 enable_logs() {
 	echo
 	echo "Сохраняю текущее значение dhcp.@dnsmasq[0].logqueries..."
@@ -602,6 +889,8 @@ disable_logs() {
 }
 
 capture_cleanup() {
+	sni_stop
+	nft_guard_disable
 	if [ "$LOGS_ENABLED" = "1" ]; then
 		disable_logs
 	fi
@@ -627,6 +916,62 @@ show_capture_tips() {
 	echo "   macOS Terminal:         sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
 	echo "   Linux terminal:         sudo resolvectl flush-caches"
 	echo "   iOS/Android:            включите/выключите авиарежим или перезапустите Wi-Fi"
+	echo "   Smart TV / приставка:   перезагрузите устройство полностью"
+	echo
+
+	tui_section "Источник доменов"
+	echo "   1) DNS + SNI  - рекомендуется, ловит и запросы, и уже закешированные домены"
+	echo "   2) только DNS - как раньше: лог dnsmasq"
+	echo "   3) только SNI - имена из TLS ClientHello, DNS не нужен"
+	echo
+	printf "Выбор [1]: "
+	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
+		echo
+		return 1
+	fi
+	case "$ANSWER" in
+		2) CAPTURE_SOURCE="dns" ;;
+		3) CAPTURE_SOURCE="sni" ;;
+		q|Q) return 1 ;;
+		*) CAPTURE_SOURCE="both" ;;
+	esac
+
+	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
+		if ! ensure_tcpdump; then
+			if [ "$CAPTURE_SOURCE" = "sni" ]; then
+				echo "Без tcpdump режим SNI недоступен."
+				return 1
+			fi
+			echo "Продолжаю только с DNS-источником."
+			CAPTURE_SOURCE="dns"
+		fi
+	fi
+
+	echo
+	tui_section "Временные сетевые правила на время сбора"
+	echo "   Перехват DNS  - завернуть :53 клиента на роутер (ловит хардкод 8.8.8.8)"
+	echo "   Блок DoT      - закрыть :853, чтобы клиент не ушёл в DNS-over-TLS"
+	echo "   Блок QUIC     - закрыть udp:443, чтобы TLS шёл по TCP и SNI был читаем"
+	tui_message "   Все правила живут в отдельной таблице nft и снимаются при выходе."
+	echo
+	printf "Включить их? [Y/n]: "
+	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
+		echo
+		return 1
+	fi
+	case "$ANSWER" in
+		n|N|no|NO|н|Н|нет|Нет|НЕТ)
+			OPT_DNS_HIJACK="0"
+			OPT_BLOCK_DOT="0"
+			OPT_BLOCK_QUIC="0"
+			;;
+		*)
+			OPT_DNS_HIJACK="1"
+			OPT_BLOCK_DOT="1"
+			OPT_BLOCK_QUIC="1"
+			;;
+	esac
+
 	echo
 	printf "%sEnter%s - начать сбор, %sq%s - назад: " "$TUI_GREEN" "$TUI_RESET" "$TUI_GREEN" "$TUI_RESET"
 	if ! IFS= read -r ANSWER < "$TTY_DEV"; then
@@ -716,25 +1061,34 @@ capture_stream() {
 		return 1
 	fi
 
+	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
+		sni_start "$MODE" "$IP_LIST"
+	fi
+
 	echo
 	echo "Сбор доменов запущен. Нажмите Ctrl+C, чтобы остановить."
 	echo "Лог сохраняется в: $LOG_FILE"
 	echo
-	echo "TIME     CLIENT_IP       DOMAIN"
-	echo "-------- --------------- ------------------------------"
+	echo "TIME     CLIENT_IP       DOMAIN                         SRC"
+	echo "-------- --------------- ------------------------------ ---"
 
-	logread -f -e dnsmasq | while IFS= read -r LINE; do
-		if ! parse_query_line "$LINE"; then
-			continue
-		fi
+	if [ "$CAPTURE_SOURCE" = "sni" ]; then
+		# Источник только SNI: работу ведёт фоновый пайплайн, ждём Ctrl+C.
+		wait
+	else
+		logread -f -e dnsmasq | while IFS= read -r LINE; do
+			if ! parse_query_line "$LINE"; then
+				continue
+			fi
 
-		if ! client_allowed "$MODE" "$IP_LIST"; then
-			continue
-		fi
+			if ! client_allowed "$MODE" "$IP_LIST"; then
+				continue
+			fi
 
-		printf "%s %s %s\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN"
-		printf "%s %s %s\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
-	done
+			printf "%s %s %s dns\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN"
+			printf "%s %s %s dns\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
+		done
+	fi
 
 	echo
 	echo "Сбор остановлен."
@@ -768,13 +1122,21 @@ start_capture() {
 		return 0
 	fi
 
-	if ! enable_logs; then
-		pause_enter
-		return 1
-	fi
-
+	# Ставим ловушки до включения чего-либо: обрыв на этапе настройки
+	# не должен оставить включённым logqueries или nft-таблицу.
 	trap 'echo; echo "Останавливаю live-сбор..."; capture_cleanup' INT
 	trap 'capture_cleanup; exit 130' TERM HUP
+
+	nft_guard_enable "$MODE" "$IP_LIST"
+
+	if [ "$CAPTURE_SOURCE" != "sni" ]; then
+		if ! enable_logs; then
+			capture_cleanup
+			trap - INT TERM HUP
+			pause_enter
+			return 1
+		fi
+	fi
 
 	capture_stream "$MODE" "$IP_LIST"
 	CAPTURE_RC="$?"
@@ -795,7 +1157,23 @@ show_unique() {
 	fi
 
 	echo "Уникальные домены из последнего лога:"
-	awk '{print $3}' /tmp/podkop-domain-capture.log | sort -u
+	awk '{print $3}' "$LOG_FILE" | sort -u
+
+	# Домены, которые видны только по SNI, — это те, что клиент открыл без DNS-запроса
+	# к роутеру: закешированный ответ, свой DoH/DoT или зашитый IP.
+	# Именно они раньше терялись полностью.
+	ONLY_SNI="$(awk '
+		$4 == "dns" { seen_dns[$3] = 1 }
+		$4 == "sni" { seen_sni[$3] = 1 }
+		END { for (d in seen_sni) if (!(d in seen_dns)) print d }
+	' "$LOG_FILE" | sort -u)"
+
+	if [ -n "$ONLY_SNI" ]; then
+		echo
+		echo "Из них пойманы только по SNI (DNS-запроса к роутеру не было):"
+		printf '%s\n' "$ONLY_SNI"
+	fi
+
 	return 0
 }
 
@@ -918,7 +1296,7 @@ show_unique_by_ip() {
 
 	echo
 	echo "Уникальные домены из последнего лога для $SELECTED_LOG_IP:"
-	awk -v ip="$SELECTED_LOG_IP" '$2==ip{print $3}' /tmp/podkop-domain-capture.log | sort -u
+	awk -v ip="$SELECTED_LOG_IP" '$2==ip{print $3}' "$LOG_FILE" | sort -u
 	return 0
 }
 
@@ -956,10 +1334,23 @@ cleanup() {
 		echo "dnsmasq logqueries уже выключен."
 	fi
 
+	if command -v nft >/dev/null 2>&1; then
+		if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+			nft delete table inet "$NFT_TABLE" 2>/dev/null &&
+				echo "Удалена оставшаяся таблица inet $NFT_TABLE."
+		fi
+	fi
+
+	if [ -s "$SNI_PID_FILE" ]; then
+		kill "$(cat "$SNI_PID_FILE")" 2>/dev/null
+	fi
+
 	rm -f "$LOG_FILE"
 	rm -f "$PREV_FILE"
 	rm -f "$CLIENTS_FILE"
 	rm -f "$LOG_IPS_FILE"
+	rm -f "$SNI_AWK_FILE"
+	rm -f "$SNI_PID_FILE"
 
 	# Для удаления временных файлов по glob временно включаем pathname expansion.
 	set +f
