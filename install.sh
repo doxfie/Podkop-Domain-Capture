@@ -5,6 +5,7 @@
 
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"
 TARGET="${TARGET:-/usr/bin/pdc}"
+EOF_MARK="# PDC-EOF"
 
 echo "Podkop Domain Capture installer"
 echo "Скачиваю скрипт:"
@@ -17,42 +18,28 @@ if ! command -v wget >/dev/null 2>&1; then
 	exit 1
 fi
 
-# Качаем рядом с целевым файлом и подменяем переименованием. Прямая запись
+fail() {
+	echo "Ошибка: $1"
+	rm -f "$NEW_FILE"
+	exit 1
+}
+
+# Качаем рядом с целевым файлом и подменяем переименованием: прямая запись
 # в "$TARGET" при обрыве связи оставила бы обрезанный исполняемый файл вместо
-# рабочей установки; mv в пределах одной ФС атомарен.
+# рабочей установки, а mv в пределах одной ФС атомарен.
 NEW_FILE="$(dirname "$TARGET")/.pdc.new"
 rm -f "$NEW_FILE"
 
-if ! wget -O "$NEW_FILE" "$SCRIPT_URL"; then
-	echo "Ошибка: не удалось скачать скрипт."
-	rm -f "$NEW_FILE"
-	exit 1
-fi
+wget -O "$NEW_FILE" "$SCRIPT_URL" || fail "не удалось скачать скрипт."
 
-# Убеждаемся, что скачали скрипт целиком, а не страницу с ошибкой.
-if ! head -n 1 "$NEW_FILE" | grep -q '^#!/bin/ash'; then
-	echo "Ошибка: скачанный файл не похож на скрипт."
-	rm -f "$NEW_FILE"
-	exit 1
-fi
+# Порог по размеру отсеивает страницы с ошибкой, маркер конца файла - обрыв
+# закачки: без него обрубок на любых 16-94% проходил все проверки.
+head -n 1 "$NEW_FILE" | grep -q '^#!/bin/ash' || fail "скачанный файл не похож на скрипт."
+[ "$(wc -c < "$NEW_FILE")" -ge 10000 ] || fail "скачанный файл слишком мал."
+tail -n 1 "$NEW_FILE" | grep -qx "$EOF_MARK" || fail "закачка оборвалась, файл неполный."
 
-if [ "$(wc -c < "$NEW_FILE")" -lt 10000 ]; then
-	echo "Ошибка: скачанный файл обрезан."
-	rm -f "$NEW_FILE"
-	exit 1
-fi
-
-if ! chmod +x "$NEW_FILE"; then
-	echo "Ошибка: не удалось сделать скрипт исполняемым."
-	rm -f "$NEW_FILE"
-	exit 1
-fi
-
-if ! mv "$NEW_FILE" "$TARGET"; then
-	echo "Ошибка: не удалось установить скрипт в $TARGET"
-	rm -f "$NEW_FILE"
-	exit 1
-fi
+chmod +x "$NEW_FILE" || fail "не удалось сделать скрипт исполняемым."
+mv "$NEW_FILE" "$TARGET" || fail "не удалось установить скрипт в $TARGET"
 
 echo
 echo "Скрипт установлен: $TARGET"
@@ -60,14 +47,8 @@ echo "Повторный запуск: pdc"
 echo "Запускаю..."
 echo
 
-if [ -t 0 ]; then
-	exec "$TARGET"
-fi
-
-if [ -c /dev/tty ]; then
-	exec "$TARGET" < /dev/tty
-fi
+[ -t 0 ] && exec "$TARGET"
+[ -c /dev/tty ] && exec "$TARGET" < /dev/tty
 
 echo "Интерактивный ввод недоступен."
-echo "Запустите скрипт вручную:"
-echo "pdc"
+echo "Запустите скрипт вручную: pdc"
