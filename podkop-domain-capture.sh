@@ -312,13 +312,15 @@ select_main_menu() {
 			enter)
 				MENU_CHOICE="$MENU_INDEX"
 				tui_stop
-				clear_screen
+				# На выходе экран не чистим: пусть меню останется на виду.
+				if [ "$MENU_CHOICE" != "5" ]; then
+					clear_screen
+				fi
 				return 0
 				;;
 			quit)
 				MENU_CHOICE="5"
 				tui_stop
-				clear_screen
 				return 0
 				;;
 			unsupported)
@@ -1664,6 +1666,7 @@ while :; do
 			pause_enter
 			;;
 		5)
+			echo
 			echo "Выход."
 			exit 0
 			;;
