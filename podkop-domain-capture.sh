@@ -1457,7 +1457,9 @@ capture_stream() {
 
 	capture_stop_sources
 
-	tui_block "Сбор остановлен" "Лог сохранен: $LOG_FILE"
+	# Открытый блок: строки снятия правил и logqueries печатает capture_cleanup
+	# уже после возврата отсюда, и они должны попасть в эту же секцию.
+	tui_block "Сбор остановлен" "Лог сохранен: $LOG_FILE" open
 	return 0
 }
 
