@@ -12,7 +12,7 @@ SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
 SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
 DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.3.2-beta"
+PDC_VERSION="0.4.0-beta"
 
 # Самообновление и зависимости.
 SCRIPT_URL="${PDC_SCRIPT_URL:-https://raw.githubusercontent.com/doxfie/Podkop-Domain-Capture/main/podkop-domain-capture.sh}"
@@ -40,6 +40,9 @@ ESC_CHAR="$(printf '\033')"
 CR_CHAR="$(printf '\r')"
 MENU_CHOICE=""
 SELECTED_IPS=""
+# IPv6-адреса выбранных клиентов, вычисляются перед стартом сбора.
+SELECTED_IPS6=""
+SELECTED_MACS=""
 SELECTED_LOG_IP=""
 CAPTURE_ALL_SELECTED="0"
 CAPTURE_MESSAGE=""
@@ -648,9 +651,52 @@ lan_subnet() {
 	ip -4 route show dev br-lan proto kernel 2>/dev/null | awk 'NR==1 { print $1 }'
 }
 
-router_lan_ip() {
+# Все IPv6-подсети br-lan: обычно ULA, глобальная и fe80::/64.
+lan_subnets6() {
+	ip -6 route show dev br-lan proto kernel 2>/dev/null | awk '{ print $1 }'
+}
+
+# Собственные адреса роутера на br-lan - их исключаем в режиме "все клиенты".
+router_lan_ips() {
 	ip -4 addr show dev br-lan 2>/dev/null |
-		awk '$1 == "inet" { split($2, a, "/"); print a[1]; exit }'
+		awk '$1 == "inet" { split($2, a, "/"); print a[1] }'
+	ip -6 addr show dev br-lan 2>/dev/null |
+		awk '$1 == "inet6" { split($2, a, "/"); print a[1] }'
+}
+
+mac_for_ip() {
+	awk -v ip="$1" '$3 == ip { print tolower($2); exit }' "$LEASES_FILE" 2>/dev/null
+}
+
+# IPv6-адреса устройства берём из таблицы соседей: DHCPv6-аренды не покрывают
+# SLAAC и приватные адреса, а сюда попадает всё, с чем роутер реально общался.
+ipv6_for_mac() {
+	ip -6 neigh show dev br-lan 2>/dev/null |
+		awk -v mac="$1" '$2 == "lladdr" && tolower($3) == mac { print $1 }' |
+		sort -u
+}
+
+# По выбранным IPv4 находим MAC устройства и все его известные IPv6.
+#
+# MAC нужен правилам и BPF: одно правило по MAC покрывает у клиента обе
+# версии протокола и все временные адреса, включая те, что появятся уже во
+# время сбора, - а privacy extensions плодят их десятками.
+# Список IPv6 нужен отдельно для фильтра DNS-лога: в логе dnsmasq есть только
+# адрес клиента, MAC там неоткуда взять.
+expand_selected_clients() {
+	SELECTED_MACS=""
+	SELECTED_IPS6=""
+	for EXPAND_IP in $1; do
+		EXPAND_MAC="$(mac_for_ip "$EXPAND_IP")"
+		if [ -z "$EXPAND_MAC" ]; then
+			continue
+		fi
+		SELECTED_MACS="$SELECTED_MACS $EXPAND_MAC"
+		for EXPAND_V6 in $(ipv6_for_mac "$EXPAND_MAC"); do
+			SELECTED_IPS6="$SELECTED_IPS6 $EXPAND_V6"
+		done
+	done
+	return 0
 }
 
 # Пишет awk-парсер TLS ClientHello. Держим его отдельным файлом, а не inline-строкой:
@@ -671,13 +717,21 @@ function b2(i,	h, l) {
 	return h * 256 + l
 }
 
-function flush(	ihl, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, name, i, c) {
+function flush(	ver, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, name, i, c) {
 	if (HEX == "" || SRC == "") return
 	if (b(0) < 0) return
-	if (int(b(0) / 16) != 4) return
-	if (b(9) != 6) return
-	ihl = (b(0) % 16) * 4
-	tcp = ihl
+
+	ver = int(b(0) / 16)
+	if (ver == 4) {
+		if (b(9) != 6) return			# protocol = TCP
+		tcp = (b(0) % 16) * 4			# IHL в 32-битных словах
+	} else if (ver == 6) {
+		if (b(6) != 6) return			# next header = TCP, без расширений
+		tcp = 40				# заголовок IPv6 фиксирован
+	} else {
+		return
+	}
+
 	doff = int(b(tcp + 12) / 16) * 4
 	if (doff < 20) return
 	p = tcp + doff
@@ -721,8 +775,13 @@ function flush(	ihl, tcp, doff, p, n, sidl, csl, cml, extl, et, el, end, nl, nam
 	HEX = ""; SRC = ""
 	TS = substr($1, 1, 8)
 	if ($2 == "IP") {
+		# 192.168.1.130.54321 - адрес это первые четыре октета
 		nf = split($3, a, ".")
 		if (nf >= 5) SRC = a[1] "." a[2] "." a[3] "." a[4]
+	} else if ($2 == "IP6") {
+		# fd6c:bfe7:e261::194.54321 - порт отделён последней точкой
+		SRC = $3
+		sub(/\.[0-9]+$/, "", SRC)
 	}
 	next
 }
@@ -959,12 +1018,29 @@ build_bpf_filter() {
 	BPF_HOSTS=""
 
 	if [ "$BPF_MODE" = "all" ]; then
-		ROUTER_IP="$(router_lan_ip)"
-		if [ -n "$ROUTER_IP" ]; then
-			BPF_HOSTS="not src host $ROUTER_IP"
+		for ONE_IP in $(router_lan_ips); do
+			if [ -z "$BPF_HOSTS" ]; then
+				BPF_HOSTS="src host $ONE_IP"
+			else
+				BPF_HOSTS="$BPF_HOSTS or src host $ONE_IP"
+			fi
+		done
+		if [ -n "$BPF_HOSTS" ]; then
+			BPF_HOSTS="not ($BPF_HOSTS)"
 		fi
+	elif [ -n "$(printf '%s' "$SELECTED_MACS" | tr -d ' ')" ]; then
+		# Отбор по MAC ловит клиента целиком: и IPv4, и IPv6, и адреса,
+		# которые устройство создаст уже во время сбора.
+		for ONE_MAC in $SELECTED_MACS; do
+			if [ -z "$BPF_HOSTS" ]; then
+				BPF_HOSTS="ether src $ONE_MAC"
+			else
+				BPF_HOSTS="$BPF_HOSTS or ether src $ONE_MAC"
+			fi
+		done
+		BPF_HOSTS="($BPF_HOSTS)"
 	else
-		for ONE_IP in $BPF_IPS; do
+		for ONE_IP in $BPF_IPS $SELECTED_IPS6; do
 			if [ -z "$BPF_HOSTS" ]; then
 				BPF_HOSTS="src host $ONE_IP"
 			else
@@ -976,13 +1052,29 @@ build_bpf_filter() {
 		fi
 	fi
 
-	# tcp[12] старшие 4 бита - data offset; первый байт payload 0x16 = TLS handshake.
-	BPF_BASE='tcp and tcp[((tcp[12:1]&0xf0)>>2)]=0x16'
+	# Первый байт TCP-payload 0x16 = начало TLS-хендшейка. Для IPv4 смещение
+	# считается через tcp[], для IPv6 так нельзя - libpcap отвергает такой
+	# фильтр, - поэтому там адресуемся от начала пакета: 40 байт фиксированного
+	# заголовка плюс длина TCP-заголовка из ip6[52].
+	BPF_V4='(ip and tcp and tcp[((tcp[12:1]&0xf0)>>2)]=0x16)'
+	BPF_V6='(ip6 and tcp and ip6[40+((ip6[52]&0xf0)>>2)]=0x16)'
+	BPF_BASE="($BPF_V4 or $BPF_V6)"
+
 	if [ -n "$BPF_HOSTS" ]; then
 		printf '%s and %s\n' "$BPF_BASE" "$BPF_HOSTS"
 	else
 		printf '%s\n' "$BPF_BASE"
 	fi
+}
+
+# В inet-таблице семья задаётся явно. Синтаксис "<семья> saddr <адрес>"
+# одинаков для всех трёх, поэтому шаблон правила от выбора не зависит.
+nft_family() {
+	case "$1" in
+		??:??:??:??:??:??) printf 'ether\n' ;;
+		*:*)               printf 'ip6\n' ;;
+		*)                 printf 'ip\n' ;;
+	esac
 }
 
 nft_guard_enable() {
@@ -999,14 +1091,20 @@ nft_guard_enable() {
 	fi
 
 	if [ "$NFT_MODE" = "all" ]; then
-		NFT_SADDR="$(lan_subnet)"
-		if [ -z "$NFT_SADDR" ]; then
-			echo "Предупреждение: не удалось определить подсеть br-lan, правила пропущены."
-			return 1
-		fi
-		NFT_SRC_LIST="$NFT_SADDR"
+		NFT_SRC_LIST="$(lan_subnet) $(lan_subnets6)"
+	elif [ -n "$(printf '%s' "$SELECTED_MACS" | tr -d ' ')" ]; then
+		# По MAC - одно правило на клиента вместо десятков по адресам.
+		NFT_SRC_LIST="$SELECTED_MACS"
 	else
-		NFT_SRC_LIST="$NFT_IPS"
+		# MAC не нашёлся в leases - откатываемся на адреса.
+		NFT_SRC_LIST="$NFT_IPS $SELECTED_IPS6"
+	fi
+
+	# Пробелы могли остаться, если какой-то из источников пуст.
+	NFT_SRC_LIST="$(printf '%s' "$NFT_SRC_LIST" | tr -s ' ')"
+	if [ -z "$(printf '%s' "$NFT_SRC_LIST" | tr -d ' ')" ]; then
+		echo "Предупреждение: не удалось определить адреса клиентов, правила пропущены."
+		return 1
 	fi
 
 	nft delete table inet "$NFT_TABLE" 2>/dev/null
@@ -1017,8 +1115,9 @@ nft_guard_enable() {
 			printf '\tchain pdc_nat_pre {\n'
 			printf '\t\ttype nat hook prerouting priority dstnat - 5; policy accept;\n'
 			for ONE_SRC in $NFT_SRC_LIST; do
-				printf '\t\tip saddr %s udp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$ONE_SRC"
-				printf '\t\tip saddr %s tcp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$ONE_SRC"
+				NFT_FAM="$(nft_family "$ONE_SRC")"
+				printf '\t\t%s saddr %s udp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$NFT_FAM" "$ONE_SRC"
+				printf '\t\t%s saddr %s tcp dport 53 counter redirect to :53 comment "pdc-dns-hijack"\n' "$NFT_FAM" "$ONE_SRC"
 			done
 			printf '\t}\n'
 		fi
@@ -1026,12 +1125,13 @@ nft_guard_enable() {
 			printf '\tchain pdc_fwd {\n'
 			printf '\t\ttype filter hook forward priority filter - 5; policy accept;\n'
 			for ONE_SRC in $NFT_SRC_LIST; do
+				NFT_FAM="$(nft_family "$ONE_SRC")"
 				if [ "$OPT_BLOCK_DOT" = "1" ]; then
-					printf '\t\tip saddr %s tcp dport 853 counter reject with tcp reset comment "pdc-block-dot"\n' "$ONE_SRC"
-					printf '\t\tip saddr %s udp dport 853 counter drop comment "pdc-block-dot"\n' "$ONE_SRC"
+					printf '\t\t%s saddr %s tcp dport 853 counter reject with tcp reset comment "pdc-block-dot"\n' "$NFT_FAM" "$ONE_SRC"
+					printf '\t\t%s saddr %s udp dport 853 counter drop comment "pdc-block-dot"\n' "$NFT_FAM" "$ONE_SRC"
 				fi
 				if [ "$OPT_BLOCK_QUIC" = "1" ]; then
-					printf '\t\tip saddr %s udp dport 443 counter drop comment "pdc-block-quic"\n' "$ONE_SRC"
+					printf '\t\t%s saddr %s udp dport 443 counter drop comment "pdc-block-quic"\n' "$NFT_FAM" "$ONE_SRC"
 				fi
 			done
 			printf '\t}\n'
@@ -1402,7 +1502,9 @@ client_allowed() {
 		return 0
 	fi
 
-	for FILTER_IP in $2; do
+	# Одно и то же устройство спрашивает DNS то с IPv4, то с IPv6-адреса,
+	# поэтому сверяемся с обоими списками.
+	for FILTER_IP in $2 $SELECTED_IPS6; do
 		if [ "$CAP_CLIENT" = "$FILTER_IP" ]; then
 			return 0
 		fi
@@ -1432,6 +1534,12 @@ capture_stream() {
 		TARGET_LABEL="все клиенты"
 	else
 		TARGET_LABEL="$IP_LIST"
+		# Показываем, сколько IPv6-адресов подтянулось: если ноль, а трафик
+		# по IPv6 идёт, значит устройства ещё нет в таблице соседей.
+		IPV6_COUNT="$(printf '%s' "$SELECTED_IPS6" | wc -w | tr -d ' ')"
+		if [ "$IPV6_COUNT" -gt 0 ]; then
+			TARGET_LABEL="$TARGET_LABEL (+$IPV6_COUNT IPv6)"
+		fi
 	fi
 
 	tui_header "Live-сбор доменов" "Источник: $SOURCE_LABEL   Клиенты: $TARGET_LABEL"
@@ -1466,6 +1574,14 @@ capture_stream() {
 start_capture() {
 	MODE="$1"
 	IP_LIST="$2"
+
+	# Адреса IPv6 нужны и правилам, и BPF, и фильтру DNS-лога, поэтому
+	# собираем их до всего остального.
+	SELECTED_IPS6=""
+	SELECTED_MACS=""
+	if [ "$MODE" != "all" ]; then
+		expand_selected_clients "$IP_LIST"
+	fi
 
 	# Ставим ловушки до включения чего-либо: обрыв на этапе настройки
 	# не должен оставить включённым logqueries или nft-таблицу.
