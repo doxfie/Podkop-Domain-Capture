@@ -440,10 +440,16 @@ render_capture_menu() {
 	CAPTURE_INDEX="$1"
 	CLIENT_TOTAL="$2"
 	START_INDEX=$((CLIENT_TOTAL + 2))
-	BACK_INDEX=$((CLIENT_TOTAL + 3))
+	SETTINGS_INDEX=$((CLIENT_TOTAL + 3))
+	BACK_INDEX=$((CLIENT_TOTAL + 4))
 
-	tui_header "Сбор доменов" "Выберите клиентов, от которых нужно поймать DNS-запросы"
+	tui_header "Сбор доменов" "Выберите клиентов, от которых нужно поймать домены"
 	tui_hint "Стрелки - выбор   Space/Enter - отметить   Enter на действии - подтвердить   q - назад"
+	echo
+
+	printf '   Источник:  %s\n' "$(capture_source_label)"
+	printf '   Правила:   %s\n' "$(capture_rules_label)"
+	tui_message "   Совет: перезагрузите устройство перед сбором - это сбросит его DNS-кеш."
 	echo
 
 	if [ "$CLIENT_TOTAL" -eq 0 ]; then
@@ -499,6 +505,12 @@ render_capture_menu() {
 		render_menu_line 0 "Начать сбор доменов"
 	fi
 
+	if [ "$CAPTURE_INDEX" -eq "$SETTINGS_INDEX" ]; then
+		render_menu_line 1 "Настройки сбора"
+	else
+		render_menu_line 0 "Настройки сбора"
+	fi
+
 	if [ "$CAPTURE_INDEX" -eq "$BACK_INDEX" ]; then
 		render_menu_line 1 "Назад"
 	else
@@ -516,7 +528,7 @@ select_capture_targets() {
 
 	CLIENT_TOTAL="$(client_count)"
 	CAPTURE_INDEX="1"
-	CAPTURE_MAX=$((CLIENT_TOTAL + 3))
+	CAPTURE_MAX=$((CLIENT_TOTAL + 4))
 	CAPTURE_ALL_SELECTED="0"
 	SELECTED_IPS=""
 	CAPTURE_MESSAGE=""
@@ -525,7 +537,8 @@ select_capture_targets() {
 
 	while :; do
 		START_INDEX=$((CLIENT_TOTAL + 2))
-		BACK_INDEX=$((CLIENT_TOTAL + 3))
+		SETTINGS_INDEX=$((CLIENT_TOTAL + 3))
+		BACK_INDEX=$((CLIENT_TOTAL + 4))
 
 		render_capture_menu "$CAPTURE_INDEX" "$CLIENT_TOTAL"
 		KEY="$(read_key)"
@@ -576,6 +589,14 @@ select_capture_targets() {
 						start_capture "selected" "$SELECTED_IPS"
 					fi
 					return 0
+				fi
+
+				if [ "$CAPTURE_INDEX" -eq "$SETTINGS_INDEX" ]; then
+					tui_stop
+					clear_screen
+					configure_capture_advanced
+					tui_start || return 1
+					continue
 				fi
 
 				if [ "$CAPTURE_INDEX" -eq "$BACK_INDEX" ]; then
@@ -1260,47 +1281,6 @@ configure_capture_advanced() {
 	return 0
 }
 
-show_capture_tips() {
-	TIPS_MODE="$1"
-	TIPS_IPS="$2"
-
-	if [ "$TIPS_MODE" = "all" ]; then
-		TIPS_TARGET="все клиенты"
-	else
-		TIPS_TARGET="$TIPS_IPS"
-	fi
-
-	while :; do
-		tui_header "Сбор доменов" "Клиенты: $TIPS_TARGET"
-		printf "   Источник:  %s\n" "$(capture_source_label)"
-		printf "   Правила:   %s\n" "$(capture_rules_label)"
-		echo
-		tui_message "   Совет: перезагрузите устройство перед сбором - это сбросит его DNS-кеш."
-		echo
-		printf "%sEnter%s - начать   %ss%s - настройки   %sq%s - назад: " \
-			"$TUI_GREEN" "$TUI_RESET" "$TUI_GREEN" "$TUI_RESET" "$TUI_GREEN" "$TUI_RESET"
-		if ! read_answer tty; then
-			echo
-			return 1
-		fi
-
-		case "$ANSWER" in
-			q|Q|й|Й)
-				return 1
-				;;
-			s|S|ы|Ы)
-				configure_capture_advanced
-				;;
-			*)
-				break
-				;;
-		esac
-	done
-
-	# tcpdump гарантирован startup_maintenance при запуске скрипта.
-	return 0
-}
-
 parse_query_line() {
 	CAP_LINE="$1"
 	CAP_TIME=""
@@ -1437,10 +1417,6 @@ ask_show_unique() {
 start_capture() {
 	MODE="$1"
 	IP_LIST="$2"
-
-	if ! show_capture_tips "$MODE" "$IP_LIST"; then
-		return 0
-	fi
 
 	# Ставим ловушки до включения чего-либо: обрыв на этапе настройки
 	# не должен оставить включённым logqueries или nft-таблицу.
