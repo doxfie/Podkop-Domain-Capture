@@ -84,6 +84,8 @@ pause_enter() {
 	echo
 	printf "Нажмите Enter, чтобы продолжить..."
 	IFS= read -r DUMMY || return 0
+	# Экран чистим только после того, как пользователь подтвердил, что прочитал вывод.
+	clear_screen
 }
 
 tui_start() {
@@ -829,6 +831,9 @@ sni_stop() {
 	fi
 	if [ -s "$SNI_PID_FILE" ]; then
 		kill "$(cat "$SNI_PID_FILE")" 2>/dev/null
+		# Даём пайплайну дописать хвост, иначе последняя строка вылезает
+		# уже поверх сообщений об остановке.
+		sleep 1
 	fi
 	rm -f "$SNI_PID_FILE"
 	SNI_ACTIVE="0"
@@ -856,8 +861,11 @@ enable_logs() {
 		echo "Ошибка: не удалось выполнить uci commit dhcp."
 		return 1
 	fi
-	if ! /etc/init.d/dnsmasq restart; then
+	# Перезапуск дёргает netifd, тот пишет в консоль udhcpc-строки. Прячем их,
+	# но сохраняем вывод, чтобы показать при реальной ошибке.
+	if ! RESTART_OUT="$(/etc/init.d/dnsmasq restart 2>&1)"; then
 		echo "Ошибка: не удалось перезапустить dnsmasq."
+		printf '%s\n' "$RESTART_OUT"
 		return 1
 	fi
 
@@ -878,8 +886,11 @@ disable_logs() {
 		echo "Ошибка: не удалось выполнить uci commit dhcp."
 		return 1
 	fi
-	if ! /etc/init.d/dnsmasq restart; then
+	# Перезапуск дёргает netifd, тот пишет в консоль udhcpc-строки. Прячем их,
+	# но сохраняем вывод, чтобы показать при реальной ошибке.
+	if ! RESTART_OUT="$(/etc/init.d/dnsmasq restart 2>&1)"; then
 		echo "Ошибка: не удалось перезапустить dnsmasq."
+		printf '%s\n' "$RESTART_OUT"
 		return 1
 	fi
 
@@ -1061,16 +1072,30 @@ capture_stream() {
 		return 1
 	fi
 
-	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
-		sni_start "$MODE" "$IP_LIST"
+	# Чистим экран до старта сбора: сообщения про nft и logqueries уже не нужны,
+	# а живые строки должны идти на пустом экране.
+	case "$CAPTURE_SOURCE" in
+		dns) SOURCE_LABEL="DNS (лог dnsmasq)" ;;
+		sni) SOURCE_LABEL="SNI (TLS ClientHello)" ;;
+		*)   SOURCE_LABEL="DNS + SNI" ;;
+	esac
+
+	if [ "$MODE" = "all" ]; then
+		TARGET_LABEL="все клиенты"
+	else
+		TARGET_LABEL="$IP_LIST"
 	fi
 
-	echo
-	echo "Сбор доменов запущен. Нажмите Ctrl+C, чтобы остановить."
+	tui_header "Live-сбор доменов" "Источник: $SOURCE_LABEL   Клиенты: $TARGET_LABEL"
+	tui_hint "Ctrl+C - остановить сбор"
 	echo "Лог сохраняется в: $LOG_FILE"
 	echo
 	echo "TIME     CLIENT_IP       DOMAIN                         SRC"
 	echo "-------- --------------- ------------------------------ ---"
+
+	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
+		sni_start "$MODE" "$IP_LIST"
+	fi
 
 	if [ "$CAPTURE_SOURCE" = "sni" ]; then
 		# Источник только SNI: работу ведёт фоновый пайплайн, ждём Ctrl+C.
@@ -1149,7 +1174,7 @@ start_capture() {
 }
 
 show_unique() {
-	echo
+	tui_header "Уникальные домены" "Результат последнего сбора"
 
 	if [ ! -s "$LOG_FILE" ]; then
 		echo "Лог $LOG_FILE не найден или пуст."
