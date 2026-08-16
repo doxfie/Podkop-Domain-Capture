@@ -34,8 +34,18 @@ MAINTENANCE_NOTED="0"
 # и чтобы весь набор правил снимался одной командой delete table.
 NFT_TABLE="pdc_capture"
 
-# Источник доменов: dns | sni | both
-CAPTURE_SOURCE="both"
+# Источник доменов: dns | sni | both.
+#
+# PDC_SOURCE=dns запускает утилиту без требования tcpdump. Нужно, когда пакет
+# принципиально не поставить - например, релиз OpenWrt уехал в архив и фид
+# отдаёт 404. Умолчание при этом не меняется: без переменной отсутствие
+# tcpdump по-прежнему останавливает запуск, чтобы сбор молча не деградировал
+# до неполного списка.
+CAPTURE_SOURCE="${PDC_SOURCE:-both}"
+case "$CAPTURE_SOURCE" in
+	dns|sni|both) ;;
+	*) CAPTURE_SOURCE="both" ;;
+esac
 # Временные сетевые правила на время сбора
 OPT_DNS_HIJACK="1"
 OPT_BLOCK_DOT="1"
@@ -976,6 +986,14 @@ install_tcpdump_or_die() {
 	echo
 	echo "Сбор по SNI - основной режим, без tcpdump он невозможен."
 	echo "Проверьте интернет и свободное место, затем запустите pdc снова."
+	echo
+	echo "Если пакет не поставить в принципе - например, релиз OpenWrt уехал"
+	echo "в архив и фид отдаёт 404, - можно собирать только по DNS:"
+	echo
+	echo "    PDC_SOURCE=dns pdc"
+	echo
+	echo "Учтите: без SNI в список не попадут домены с закешированным ответом,"
+	echo "клиенты со своим DoH/DoT и с зашитым в прошивку IP."
 	exit 1
 }
 
@@ -1112,20 +1130,22 @@ mark_update_done() {
 }
 
 startup_maintenance() {
-	if ! command -v tcpdump >/dev/null 2>&1; then
+	# Требуем tcpdump, только если SNI вообще может понадобиться.
+	if ! command -v tcpdump >/dev/null 2>&1 && [ "$CAPTURE_SOURCE" != "dns" ]; then
 		install_tcpdump_or_die
 		mark_update_done
-	else
-		# Уже перезапускались после обновления - второй круг не нужен.
-		if [ -z "$PDC_UPDATED" ] && update_due; then
-			echo "Проверяю обновления..."
-			mark_update_done
+	# Уже перезапускались после обновления - второй круг не нужен.
+	elif [ -z "$PDC_UPDATED" ] && update_due; then
+		echo "Проверяю обновления..."
+		mark_update_done
+		# Обновлять нечего, если пакета нет: в режиме dns это норма.
+		if command -v tcpdump >/dev/null 2>&1; then
 			update_tcpdump
-			# Может не вернуться: обновит скрипт и сделает exec.
-			update_script
-			if [ "$MAINTENANCE_NOTED" = "0" ]; then
-				echo "Всё актуально."
-			fi
+		fi
+		# Может не вернуться: обновит скрипт и сделает exec.
+		update_script
+		if [ "$MAINTENANCE_NOTED" = "0" ]; then
+			echo "Всё актуально."
 		fi
 	fi
 
@@ -1579,6 +1599,13 @@ configure_capture_advanced() {
 		3) CAPTURE_SOURCE="sni" ;;
 	esac
 
+	# Утилиту могли запустить с PDC_SOURCE=dns именно потому, что пакета нет.
+	if [ "$CAPTURE_SOURCE" != "dns" ] && ! command -v tcpdump >/dev/null 2>&1; then
+		echo
+		tui_message "tcpdump не установлен, источник SNI недоступен - остаётся DNS."
+		CAPTURE_SOURCE="dns"
+	fi
+
 	echo
 	tui_section "Временные правила на время сбора"
 	tui_message "   Живут в отдельной таблице nft и снимаются при остановке."
@@ -1739,9 +1766,21 @@ capture_stream() {
 	printf '%s %s %s %s\n' \
 		"$(dashes 8)" "$(dashes "$CLIENT_COL_W")" "---" "$(dashes 40)"
 
+	SNI_STARTED="0"
 	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
-		sni_start "$MODE" "$IP_LIST"
+		if sni_start "$MODE" "$IP_LIST"; then
+			SNI_STARTED="1"
+		fi
 	fi
+
+	# При источнике "только SNI" его отказ означает сбор без единого источника:
+	# пустая таблица и ожидание клавиши. Лучше сразу прекратить.
+	if [ "$CAPTURE_SOURCE" = "sni" ] && [ "$SNI_STARTED" = "0" ]; then
+		echo
+		echo "Сбор не запущен: SNI - единственный выбранный источник."
+		return 1
+	fi
+
 	if [ "$CAPTURE_SOURCE" = "dns" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
 		dns_start "$MODE" "$IP_LIST"
 	fi
