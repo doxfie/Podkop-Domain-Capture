@@ -10,6 +10,7 @@ CLIENTS_FILE="/tmp/podkop-domain-capture.clients"
 LOG_IPS_FILE="/tmp/podkop-domain-capture.log-ips"
 SNI_AWK_FILE="/tmp/podkop-domain-capture.sni.awk"
 SNI_PID_FILE="/tmp/podkop-domain-capture.tcpdump.pid"
+DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
 TTY_DEV="/dev/tty"
 PDC_VERSION="0.3.0-beta"
 
@@ -33,6 +34,7 @@ OPT_BLOCK_DOT="1"
 OPT_BLOCK_QUIC="1"
 NFT_ACTIVE="0"
 SNI_ACTIVE="0"
+DNS_ACTIVE="0"
 
 ESC_CHAR="$(printf '\033')"
 CR_CHAR="$(printf '\r')"
@@ -1030,12 +1032,62 @@ sni_stop() {
 	fi
 	if [ -s "$SNI_PID_FILE" ]; then
 		kill "$(cat "$SNI_PID_FILE")" 2>/dev/null
-		# Даём пайплайну дописать хвост, иначе последняя строка вылезает
-		# уже поверх сообщений об остановке.
-		sleep 1
 	fi
 	rm -f "$SNI_PID_FILE"
 	SNI_ACTIVE="0"
+	return 0
+}
+
+# DNS-источник тоже работает фоном - в переднем плане ждём нажатия клавиши.
+dns_start() {
+	DNS_MODE="$1"
+	DNS_IPS="$2"
+	rm -f "$DNS_PID_FILE"
+
+	# Тот же приём, что и с tcpdump: внутренний sh пишет свой PID и делает
+	# exec logread, поэтому в PID-файле оказывается именно logread.
+	sh -c 'echo $$ > "$1"; exec logread -f -e dnsmasq' _ "$DNS_PID_FILE" |
+		while IFS= read -r LINE; do
+			if ! parse_query_line "$LINE"; then
+				continue
+			fi
+			if ! client_allowed "$DNS_MODE" "$DNS_IPS"; then
+				continue
+			fi
+			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN"
+			printf '%s %s %s dns\n' "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
+		done &
+
+	DNS_ACTIVE="1"
+	return 0
+}
+
+dns_stop() {
+	if [ "$DNS_ACTIVE" != "1" ]; then
+		return 0
+	fi
+	if [ -s "$DNS_PID_FILE" ]; then
+		kill "$(cat "$DNS_PID_FILE")" 2>/dev/null
+	fi
+	rm -f "$DNS_PID_FILE"
+	DNS_ACTIVE="0"
+	return 0
+}
+
+# Останавливает оба источника и даёт им дописать хвост: иначе последние
+# строки вылезают уже поверх сообщений об остановке.
+capture_stop_sources() {
+	STOP_NEEDED="0"
+	if [ "$SNI_ACTIVE" = "1" ] || [ "$DNS_ACTIVE" = "1" ]; then
+		STOP_NEEDED="1"
+	fi
+
+	sni_stop
+	dns_stop
+
+	if [ "$STOP_NEEDED" = "1" ]; then
+		sleep 1
+	fi
 	return 0
 }
 
@@ -1099,11 +1151,12 @@ disable_logs() {
 }
 
 capture_cleanup() {
-	sni_stop
+	capture_stop_sources
 	nft_guard_disable
 	if [ "$LOGS_ENABLED" = "1" ]; then
 		disable_logs
 	fi
+	return 0
 }
 
 capture_source_label() {
@@ -1336,7 +1389,7 @@ capture_stream() {
 	fi
 
 	tui_header "Live-сбор доменов" "Источник: $SOURCE_LABEL   Клиенты: $TARGET_LABEL"
-	tui_hint "Ctrl+C - остановить сбор"
+	tui_hint "Любая клавиша - остановить сбор"
 	echo "Лог сохраняется в: $LOG_FILE"
 	echo
 	echo "TIME     CLIENT_IP       DOMAIN                         SRC"
@@ -1345,24 +1398,17 @@ capture_stream() {
 	if [ "$CAPTURE_SOURCE" = "sni" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
 		sni_start "$MODE" "$IP_LIST"
 	fi
-
-	if [ "$CAPTURE_SOURCE" = "sni" ]; then
-		# Источник только SNI: работу ведёт фоновый пайплайн, ждём Ctrl+C.
-		wait
-	else
-		logread -f -e dnsmasq | while IFS= read -r LINE; do
-			if ! parse_query_line "$LINE"; then
-				continue
-			fi
-
-			if ! client_allowed "$MODE" "$IP_LIST"; then
-				continue
-			fi
-
-			printf "%s %s %s dns\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN"
-			printf "%s %s %s dns\n" "$CAP_TIME" "$CAP_CLIENT" "$CAP_DOMAIN" >> "$LOG_FILE"
-		done
+	if [ "$CAPTURE_SOURCE" = "dns" ] || [ "$CAPTURE_SOURCE" = "both" ]; then
+		dns_start "$MODE" "$IP_LIST"
 	fi
+
+	# Оба источника работают фоном, здесь просто ждём нажатия. Если сборка
+	# BusyBox не умеет read -s -n 1, остаётся прежний путь - Ctrl+C.
+	if ! read_char; then
+		wait
+	fi
+
+	capture_stop_sources
 
 	echo
 	echo "Сбор остановлен."
