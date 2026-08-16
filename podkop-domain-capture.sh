@@ -224,6 +224,17 @@ tui_header() {
 	printf '%s%s%s\n\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
 }
 
+# Заголовок секции прямо в потоке вывода: выглядит как шапка экрана, но не
+# чистит его - нужен там, где под заголовком должно остаться напечатанное выше.
+tui_block() {
+	printf '\n%s%s%s\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
+	printf '%s%s%s%s\n' "$TUI_BOLD" "$TUI_GREEN" "$1" "$TUI_RESET"
+	if [ -n "$2" ]; then
+		printf '%s%s%s\n' "$TUI_DIM" "$2" "$TUI_RESET"
+	fi
+	printf '%s%s%s\n\n' "$TUI_CYAN" "$TUI_LINE" "$TUI_RESET"
+}
+
 tui_hint() {
 	printf '%s%s%s\n' "$TUI_DIM" "$1" "$TUI_RESET"
 }
@@ -1442,9 +1453,7 @@ capture_stream() {
 
 	capture_stop_sources
 
-	echo
-	echo "Сбор остановлен"
-	echo "Лог сохранен: $LOG_FILE"
+	tui_block "Сбор остановлен" "Лог сохранен: $LOG_FILE"
 	return 0
 }
 
@@ -1480,36 +1489,21 @@ start_capture() {
 }
 
 show_unique() {
-	tui_header "Уникальные домены" "Результат последнего сбора"
+	clear_screen
 	print_unique_domains
 }
 
-# Печатает список без шапки и без очистки экрана: после сбора он должен
-# лечь под собранные строки, а не заменить их.
+# Печатает список со своим заголовком, но без очистки экрана: после сбора он
+# должен лечь под собранные строки, а не заменить их.
 print_unique_domains() {
 	if [ ! -s "$LOG_FILE" ]; then
-		echo "Лог $LOG_FILE не найден или пуст."
+		tui_block "Уникальные домены" "Лог $LOG_FILE не найден или пуст"
 		return 1
 	fi
 
-	echo "Уникальные домены из последнего лога:"
+	UNIQUE_COUNT="$(awk '{print $3}' "$LOG_FILE" | sort -u | wc -l | tr -d ' ')"
+	tui_block "Уникальные домены" "Найдено: $UNIQUE_COUNT   Лог: $LOG_FILE"
 	awk '{print $3}' "$LOG_FILE" | sort -u
-
-	# Домены, которые видны только по SNI, — это те, что клиент открыл без DNS-запроса
-	# к роутеру: закешированный ответ, свой DoH/DoT или зашитый IP.
-	# Именно они раньше терялись полностью.
-	ONLY_SNI="$(awk '
-		$4 == "dns" { seen_dns[$3] = 1 }
-		$4 == "sni" { seen_sni[$3] = 1 }
-		END { for (d in seen_sni) if (!(d in seen_dns)) print d }
-	' "$LOG_FILE" | sort -u)"
-
-	if [ -n "$ONLY_SNI" ]; then
-		echo
-		echo "Из них пойманы только по SNI (DNS-запроса к роутеру не было):"
-		printf '%s\n' "$ONLY_SNI"
-	fi
-
 	return 0
 }
 
@@ -1630,8 +1624,8 @@ show_unique_by_ip() {
 		return "$SELECT_LOG_IP_RC"
 	fi
 
-	echo
-	echo "Уникальные домены из последнего лога для $SELECTED_LOG_IP:"
+	BY_IP_COUNT="$(awk -v ip="$SELECTED_LOG_IP" '$2==ip{print $3}' "$LOG_FILE" | sort -u | wc -l | tr -d ' ')"
+	tui_block "Уникальные домены" "Клиент: $SELECTED_LOG_IP   Найдено: $BY_IP_COUNT"
 	awk -v ip="$SELECTED_LOG_IP" '$2==ip{print $3}' "$LOG_FILE" | sort -u
 	return 0
 }
