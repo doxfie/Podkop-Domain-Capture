@@ -14,7 +14,7 @@ SNI_ERR_FILE="/tmp/podkop-domain-capture.tcpdump.err"
 DNS_PID_FILE="/tmp/podkop-domain-capture.logread.pid"
 NFT_FILE="/tmp/podkop-domain-capture.nft"
 TTY_DEV="/dev/tty"
-PDC_VERSION="0.4.0-beta"
+PDC_VERSION="0.4.1-beta"
 
 # Обновляемся по последнему релизу, а не по ветке: в ветку попадает и работа
 # в процессе. PDC_SCRIPT_URL перекрывает всё и берёт файл напрямую.
