@@ -215,6 +215,13 @@ tui_hint()    { printf '%s%s%s\n' "$TUI_DIM" "$1" "$TUI_RESET"; }
 tui_section() { printf '%s%s%s\n' "$TUI_CYAN" "$1" "$TUI_RESET"; }
 tui_message() { printf '%s%s%s\n' "$TUI_YELLOW" "$1" "$TUI_RESET"; }
 
+# Строка прогресса. Подготовка к сбору - служебный шум рядом с живыми данными,
+# поэтому печатается тем же приглушённым стилем, что и подсказки.
+tui_step()      { printf '%s%s' "$TUI_DIM" "$1"; }
+tui_step_done() { printf '%s%s\n' "$1" "$TUI_RESET"; }
+# Обрывает строку прогресса перед сообщением об ошибке, сбрасывая стиль.
+tui_step_fail() { printf '%s\n' "$TUI_RESET"; }
+
 # $1 - индекс под курсором, $2 - индекс строки, $3 - текст.
 render_menu_line() {
 	if [ "$1" -eq "$2" ]; then
@@ -978,14 +985,14 @@ nft_guard_enable() {
 
 	rm -f "$NFT_FILE"
 	NFT_ACTIVE="1"
-	echo "Временные сетевые правила включены (таблица inet $NFT_TABLE)"
+	tui_hint "Временные сетевые правила включены (таблица inet $NFT_TABLE)"
 	return 0
 }
 
 nft_guard_disable() {
 	[ "$NFT_ACTIVE" = "1" ] || return 0
 	if nft delete table inet "$NFT_TABLE" 2>/dev/null; then
-		echo "Временные сетевые правила сняты"
+		tui_hint "Временные сетевые правила сняты"
 	else
 		echo "Предупреждение: не удалось снять таблицу inet $NFT_TABLE."
 		echo "Снимите вручную: nft delete table inet $NFT_TABLE"
@@ -1075,8 +1082,7 @@ capture_stop_sources() {
 }
 
 enable_logs() {
-	echo
-	printf 'Включаю dnsmasq logqueries... '
+	tui_step 'Включаю dnsmasq logqueries... '
 
 	# Пишем только если сохранённого значения ещё нет: иначе первый сбор сохранил
 	# бы "unset", восстановление сорвалось, а второй сбор записал бы уже единицу,
@@ -1089,20 +1095,20 @@ enable_logs() {
 	fi
 
 	if ! uci set 'dhcp.@dnsmasq[0].logqueries=1' || ! uci commit dhcp; then
-		echo
+		tui_step_fail
 		echo "Ошибка: не удалось изменить настройку dnsmasq"
 		return 1
 	fi
 	# Перезапуск дёргает netifd, тот пишет в консоль udhcpc-строки. Прячем их,
 	# но сохраняем вывод, чтобы показать при реальной ошибке.
 	if ! RESTART_OUT="$(/etc/init.d/dnsmasq restart 2>&1)"; then
-		echo
+		tui_step_fail
 		echo "Ошибка: не удалось перезапустить dnsmasq"
 		printf '%s\n' "$RESTART_OUT"
 		return 1
 	fi
 
-	echo "готово"
+	tui_step_done 'готово'
 	LOGS_ENABLED="1"
 	return 0
 }
@@ -1121,9 +1127,9 @@ disable_logs() {
 	esac
 
 	if [ "$RESTORE_TO" = "0" ]; then
-		printf 'Выключаю dnsmasq logqueries... '
+		tui_step 'Выключаю dnsmasq logqueries... '
 	else
-		printf 'Возвращаю dnsmasq logqueries... '
+		tui_step 'Возвращаю dnsmasq logqueries... '
 	fi
 
 	if [ "$RESTORE_TO" = "unset" ]; then
@@ -1131,29 +1137,29 @@ disable_logs() {
 		# поэтому проверяем итог, а не код возврата.
 		uci -q delete 'dhcp.@dnsmasq[0].logqueries'
 		if [ -n "$(uci -q get 'dhcp.@dnsmasq[0].logqueries')" ]; then
-			echo
+			tui_step_fail
 			echo "Ошибка: не удалось убрать logqueries"
 			return 1
 		fi
 	elif ! uci set "dhcp.@dnsmasq[0].logqueries=$RESTORE_TO"; then
-		echo
+		tui_step_fail
 		echo "Ошибка: не удалось выполнить uci set"
 		return 1
 	fi
 
 	if ! uci commit dhcp; then
-		echo
+		tui_step_fail
 		echo "Ошибка: не удалось выполнить uci commit dhcp"
 		return 1
 	fi
 	if ! RESTART_OUT="$(/etc/init.d/dnsmasq restart 2>&1)"; then
-		echo
+		tui_step_fail
 		echo "Ошибка: не удалось перезапустить dnsmasq"
 		printf '%s\n' "$RESTART_OUT"
 		return 1
 	fi
 
-	echo "готово"
+	tui_step_done 'готово'
 	LOGS_ENABLED="0"
 	return 0
 }
@@ -1322,6 +1328,15 @@ capture_stream() {
 	echo "Лог сохраняется в: $LOG_FILE"
 	echo
 
+	# Подготовка идёт уже под шапкой: её след остаётся на экране сбора, а не
+	# мелькает отдельным кадром. Перезапуск dnsmasq занимает секунду-другую,
+	# и строка прогресса объясняет паузу.
+	nft_guard_enable "$MODE" "$IP_LIST"
+	if [ "$CAPTURE_SOURCE" != "sni" ] && ! enable_logs; then
+		return 1
+	fi
+	echo
+
 	# Клиента вне подсети интерфейса tcpdump не увидит: DNS по нему пойдёт,
 	# SNI нет, и со стороны это выглядит как потеря половины доменов.
 	if [ "$MODE" != "all" ]; then
@@ -1379,15 +1394,8 @@ start_capture() {
 	trap 'echo; echo "Останавливаю live-сбор..."; capture_cleanup' INT
 	trap 'capture_cleanup; exit 130' TERM HUP
 
-	nft_guard_enable "$MODE" "$IP_LIST"
-
-	if [ "$CAPTURE_SOURCE" != "sni" ] && ! enable_logs; then
-		capture_cleanup
-		trap - INT TERM HUP
-		pause_enter
-		return 1
-	fi
-
+	# Правила и logqueries включает сам capture_stream, уже под своей шапкой:
+	# иначе эти две строки мелькали бы на отдельном экране и стирались.
 	capture_stream "$MODE" "$IP_LIST"
 	CAPTURE_RC="$?"
 
