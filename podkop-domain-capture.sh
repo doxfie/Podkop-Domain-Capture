@@ -277,7 +277,8 @@ select_main_menu() {
 # /tmp/dhcp.leases: expires_epoch mac ip hostname client_id
 load_clients() {
 	if [ ! -s "$LEASES_FILE" ]; then
-		: > "$CLIENTS_FILE"
+		# В подоболочке: ошибка редиректа на ":" завершила бы весь шелл.
+		( : > "$CLIENTS_FILE" ) 2>/dev/null
 		return
 	fi
 
@@ -1313,11 +1314,6 @@ capture_stream() {
 		return 1
 	fi
 
-	if ! : > "$LOG_FILE"; then
-		echo "Ошибка: не удалось создать файл $LOG_FILE."
-		return 1
-	fi
-
 	# Колонку под адрес расширяем только когда в сборе возможен IPv6: при чистом
 	# IPv4 широкая колонка оставляет полэкрана пустоты.
 	CLIENT_COL_W="15"
@@ -1336,6 +1332,18 @@ capture_stream() {
 		return 1
 	fi
 	echo
+
+	# Лог обнуляем последним: всё, что может не задаться, уже позади, а источники
+	# стартуют ниже. Раньше усечение шло до подготовки, и её отказ уносил
+	# предыдущий сбор впустую.
+	#
+	# Усечение в подоболочке, потому что ":" - специальный встроенный: ошибка
+	# редиректа на нём завершает весь неинтерактивный шелл, и ветка ниже никогда
+	# бы не отработала. Скобки оставляют смерть внутри подоболочки.
+	if ! ( : > "$LOG_FILE" ) 2>/dev/null; then
+		echo "Ошибка: не удалось создать файл $LOG_FILE."
+		return 1
+	fi
 
 	# Клиента вне подсети интерфейса tcpdump не увидит: DNS по нему пойдёт,
 	# SNI нет, и со стороны это выглядит как потеря половины доменов.
@@ -1390,8 +1398,10 @@ start_capture() {
 	[ "$MODE" != "all" ] && expand_selected_clients "$IP_LIST"
 
 	# Ловушки до включения чего-либо: обрыв на этапе настройки не должен
-	# оставить включённым logqueries или nft-таблицу.
-	trap 'echo; echo "Останавливаю live-сбор..."; capture_cleanup' INT
+	# оставить включённым logqueries или nft-таблицу. Стиль сбрасываем первым:
+	# Ctrl+C вероятнее всего прилетит на перезапуске dnsmasq, то есть при
+	# открытой строке прогресса, и сообщение ушло бы приглушённым.
+	trap 'printf "%s\n" "$TUI_RESET"; echo "Останавливаю live-сбор..."; capture_cleanup' INT
 	trap 'capture_cleanup; exit 130' TERM HUP
 
 	# Правила и logqueries включает сам capture_stream, уже под своей шапкой:
@@ -1401,7 +1411,9 @@ start_capture() {
 
 	trap - INT TERM HUP
 	capture_cleanup
-	print_unique_domains
+	# Только если сбор состоялся: иначе список показывал бы домены прошлого
+	# сбора, а это читается как будто текущий прошёл успешно.
+	[ "$CAPTURE_RC" -eq 0 ] && print_unique_domains
 	pause_enter
 	return "$CAPTURE_RC"
 }
